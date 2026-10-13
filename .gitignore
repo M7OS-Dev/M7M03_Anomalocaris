@@ -1,0 +1,19 @@
+# Rust build output
+/target
+
+# Built raw binary image
+/build
+
+# Object files
+*.o
+*.obj
+
+# Linker output
+*.elf
+
+# Raw binary images
+*.bin
+
+# Editor/IDE
+.vscode/
+.idea/

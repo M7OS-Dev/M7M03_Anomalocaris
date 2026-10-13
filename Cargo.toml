@@ -1,0 +1,21 @@
+[package]
+name = "m7m03_anomalocaris"
+version = "0.1.0"
+edition = "2024"
+authors = ["Yang Hongyun <2805457044@qq.com>"]
+license = "Unlicense"
+description = "The first user-mode program (init) for the RV64V port of the RME microkernel (M7M01_Eukaron), written in Rust. Runs in U-mode as the init thread on QEMU virt."
+
+# Name the built ELF "init" so the raw binary is naturally "init.bin",
+# matching the C init program it replaces in the kernel repository.
+[[bin]]
+name = "init"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

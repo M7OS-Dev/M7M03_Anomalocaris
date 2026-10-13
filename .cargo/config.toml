@@ -1,0 +1,11 @@
+# Build configuration for the bare-metal RISC-V RV64 target.
+# The riscv64gc-unknown-none-elf target must be installed first:
+#   rustup target add riscv64gc-unknown-none-elf
+
+[build]
+target = "riscv64gc-unknown-none-elf"
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+    "-C", "link-arg=-Tinit.ld",
+]
