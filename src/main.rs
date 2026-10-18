@@ -5,15 +5,14 @@ Date        : 13/10/2026
 Licence     : The Unlicense; see LICENSE for details.
 Description : The first user-mode program (init) for the RV64V port on
               QEMU virt, written in Rust. Runs in U-mode as the init thread,
-              entered by the kernel via __RME_User_Enter. Prints the uppercase
-              alphabet (A-Z) on a single line through the DEBUG_PRINT
-              kernel-function capability syscall, then idles in a busy loop
-              (WFI is an illegal instruction on QEMU).
-              This is a Rust replacement for the C init program that lives in
-              the RME microkernel repository (M7M01_Eukaron) at
-              Project/GCC-RV64V/init/. See the README for the build and
-              deployment flow, which references M7M01_Eukaron the same way
-              M7M02_Ammonite does.
+              entered by the kernel via __RME_User_Enter. Runs the thread-switch
+              benchmark (a Rust port of rme_benchmark.c), then idles in a busy
+              loop (WFI is an illegal instruction on QEMU).
+              This is the init program (first user process) for the RV64V port
+              of the RME microkernel (M7M01_Eukaron), written in Rust. The
+              kernel's Project/GCC-RV64V build invokes this project's build.sh
+              and copies the resulting build/init.bin into its Object/ folder,
+              where qemu.sh loads it at 0x81030000.
 ******************************************************************************/
 
 /* Attribute *****************************************************************/
@@ -22,11 +21,12 @@ Description : The first user-mode program (init) for the RV64V port on
 /* End Attribute *************************************************************/
 
 /* Include *******************************************************************/
+mod benchmark;
 mod syscall;
 
 use core::panic::PanicInfo;
 
-use syscall::{RME_BOOT_INIT_KFN, RME_KFN_DEBUG_PRINT, RME_SVC_KFN, rme_syscall};
+use benchmark::rme_benchmark;
 /* End Include ***************************************************************/
 
 /* Entry:_start ***************************************************************
@@ -75,53 +75,17 @@ _start:
 );
 /* End Entry:_start **********************************************************/
 
-/* Function:print_char ********************************************************
-Description : Print one character by invoking the DEBUG_PRINT kernel function.
-              Param0 packs D0 = Func_ID (DEBUG_PRINT) and D1 = Sub_ID (the
-              character).
-Input       : ch - The character to print.
-Output      : None.
-Return      : None.
-******************************************************************************/
-fn print_char(ch: u8) {
-    /* Param0 = (Sub_ID << 32) | Func_ID */
-    let param0: u64 = ((ch as u64) << 32) | RME_KFN_DEBUG_PRINT;
-
-    let _ = rme_syscall(RME_SVC_KFN, RME_BOOT_INIT_KFN, param0, 0, 0);
-}
-/* End Function:print_char ***************************************************/
-
-/* Function:print_str *********************************************************
-Description : Print a byte slice, one syscall per character.
-Input       : s - The characters to print.
-Output      : None.
-Return      : None.
-******************************************************************************/
-fn print_str(s: &[u8]) {
-    for &ch in s {
-        print_char(ch);
-    }
-}
-/* End Function:print_str ****************************************************/
-
 /* Function:main **************************************************************
 Description : The entry point of the init program. The assembly bootstrap in
               _start sets up the runtime environment, then calls this
-              function. Prints the uppercase alphabet, then idles forever.
+              function. Runs the thread-switch benchmark, then idles forever.
 Input       : None.
 Output      : None.
 Return      : ! - This function never returns.
 ******************************************************************************/
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> ! {
-    /* Print the uppercase alphabet A-Z on a single line */
-    for ch in b'A'..=b'Z' {
-        print_char(ch);
-    }
-    print_str(b"\r\n");
-
-    /* Idle forever - busy loop, no WFI (illegal instruction on QEMU) */
-    loop {}
+    rme_benchmark()
 }
 /* End Function:main *********************************************************/
 

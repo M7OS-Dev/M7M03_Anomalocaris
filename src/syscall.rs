@@ -120,9 +120,120 @@ pub const RME_KFN_DEBUG_MODE_MOD: RmePtr = 0xF804;
 pub const RME_KFN_DEBUG_IBP_MOD: RmePtr = 0xF805;
 pub const RME_KFN_DEBUG_DBP_MOD: RmePtr = 0xF806;
 
-/* Boot capability slot for the init KFN (mirror of rme_platform_rv64v.h) ****/
+/* Boot capability slots (mirror of rme_platform_rv64v.h) ********************/
+pub const RME_BOOT_INIT_CPT: RmePtr = 0;
+pub const RME_BOOT_INIT_PGT: RmePtr = 1;
+pub const RME_BOOT_INIT_PGT_L1: RmePtr = 7;
+pub const RME_BOOT_INIT_PGT_L2: RmePtr = 8;
+pub const RME_BOOT_INIT_PRC: RmePtr = 2;
+pub const RME_BOOT_INIT_THD: RmePtr = 3;
 pub const RME_BOOT_INIT_KFN: RmePtr = 4;
+pub const RME_BOOT_INIT_KOM: RmePtr = 5;
+pub const RME_BOOT_INIT_VCT: RmePtr = 6;
+/* The null capability ID - high bit of the D1 field */
+pub const RME_CID_NULL: RmePtr = 0x80000000;
+
+/* Page table flags (mirror of Include/rme.h) ********************************/
+pub const RME_PGT_READ: RmePtr = 1 << 0;
+pub const RME_PGT_WRITE: RmePtr = 1 << 1;
+pub const RME_PGT_EXECUTE: RmePtr = 1 << 2;
+pub const RME_PGT_CACHE: RmePtr = 1 << 3;
+pub const RME_PGT_BUFFER: RmePtr = 1 << 4;
+pub const RME_PGT_STATIC: RmePtr = 1 << 5;
+pub const RME_PGT_ALL_DYN: RmePtr =
+    RME_PGT_READ | RME_PGT_WRITE | RME_PGT_EXECUTE | RME_PGT_CACHE | RME_PGT_BUFFER;
+pub const RME_PGT_ALL_PERM: RmePtr = RME_PGT_ALL_DYN | RME_PGT_STATIC;
+
+/* Page table size/num orders (mirror of Include/rme.h) **********************/
+pub const RME_PGT_SIZE_4K: RmePtr = 12;
+pub const RME_PGT_SIZE_2M: RmePtr = 21;
+pub const RME_PGT_SIZE_1G: RmePtr = 30;
+pub const RME_PGT_NUM_512: RmePtr = 9;
+
+/* Thread flags (mirror of Include/rme.h) ************************************/
+pub const RME_THD_FLAG_EXEC_SET: RmePtr = 1 << 0;
+pub const RME_THD_FLAG_SCHED_CHILD: RmePtr = 1 << 1;
+pub const RME_THD_FLAG_SCHED_PARENT: RmePtr = 1 << 2;
+pub const RME_THD_FLAG_SCHED_PRIO: RmePtr = 1 << 3;
+pub const RME_THD_FLAG_SCHED_FREE: RmePtr = 1 << 4;
+pub const RME_THD_FLAG_SCHED_RCV: RmePtr = 1 << 5;
+pub const RME_THD_FLAG_XFER_SRC: RmePtr = 1 << 6;
+pub const RME_THD_FLAG_XFER_DST: RmePtr = 1 << 7;
+pub const RME_THD_FLAG_SWT: RmePtr = 1 << 8;
+pub const RME_THD_FLAG_ALL: RmePtr = RME_THD_FLAG_EXEC_SET
+    | RME_THD_FLAG_SCHED_CHILD
+    | RME_THD_FLAG_SCHED_PARENT
+    | RME_THD_FLAG_SCHED_PRIO
+    | RME_THD_FLAG_SCHED_FREE
+    | RME_THD_FLAG_SCHED_RCV
+    | RME_THD_FLAG_XFER_SRC
+    | RME_THD_FLAG_XFER_DST
+    | RME_THD_FLAG_SWT;
 /* End Define ****************************************************************/
+
+/* Parameter packing *********************************************************/
+/* On RV64V the word is 64 bits (RME_WORD_ORDER=6, RME_WORD_BYTE=8), so:
+ *   D1/D0 : 32-bit halves
+ *   Q3..Q0: 16-bit quarters
+ *   O7..O0: 8-bit eighths
+ * These mirror the user-side packing of the C benchmark (RME_PARAM_*). */
+#[inline(always)]
+pub const fn rme_param_d1(x: RmePtr) -> RmePtr {
+    (x & 0xFFFFFFFF) << 32
+}
+#[inline(always)]
+pub const fn rme_param_d0(x: RmePtr) -> RmePtr {
+    x & 0xFFFFFFFF
+}
+#[inline(always)]
+pub const fn rme_param_q3(x: RmePtr) -> RmePtr {
+    (x & 0xFFFF) << 48
+}
+#[inline(always)]
+pub const fn rme_param_q2(x: RmePtr) -> RmePtr {
+    (x & 0xFFFF) << 32
+}
+#[inline(always)]
+pub const fn rme_param_q1(x: RmePtr) -> RmePtr {
+    (x & 0xFFFF) << 16
+}
+#[inline(always)]
+pub const fn rme_param_q0(x: RmePtr) -> RmePtr {
+    x & 0xFFFF
+}
+#[inline(always)]
+pub const fn rme_param_o7(x: RmePtr) -> RmePtr {
+    (x & 0xFF) << 56
+}
+#[inline(always)]
+pub const fn rme_param_o6(x: RmePtr) -> RmePtr {
+    (x & 0xFF) << 48
+}
+#[inline(always)]
+pub const fn rme_param_o5(x: RmePtr) -> RmePtr {
+    (x & 0xFF) << 40
+}
+#[inline(always)]
+pub const fn rme_param_o4(x: RmePtr) -> RmePtr {
+    (x & 0xFF) << 32
+}
+#[inline(always)]
+pub const fn rme_param_o3(x: RmePtr) -> RmePtr {
+    (x & 0xFF) << 24
+}
+#[inline(always)]
+pub const fn rme_param_o2(x: RmePtr) -> RmePtr {
+    (x & 0xFF) << 16
+}
+#[inline(always)]
+pub const fn rme_param_o1(x: RmePtr) -> RmePtr {
+    (x & 0xFF) << 8
+}
+#[inline(always)]
+pub const fn rme_param_o0(x: RmePtr) -> RmePtr {
+    x & 0xFF
+}
+/* End Parameter packing *****************************************************/
 
 /* Function:rme_syscall *******************************************************
 Description : The generic system call - the only ecall in the user program.
