@@ -226,6 +226,7 @@ fn rme_bench_report(count: usize, title: &[u8]) {
     rme_print_str(b"  average= ");
     rme_print_uint(sum / (count as u64));
     rme_print_str(b" cycles\r\n");
+    rme_print_str(b"RME BENCH REPORT OK\r\n");
 }
 /* End Function:rme_bench_report *********************************************/
 
