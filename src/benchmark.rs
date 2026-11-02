@@ -32,20 +32,20 @@ Description : The benchmark test for the RV64V port, mirroring the C
 
 /* Define ********************************************************************/
 /* The test objects - free capability slots after the RV64V boot caps
- * (0..8 are CPT/PGT/PRC/THD/KFN/KOM/VCT/PGT_L1/PGT_L2, see
- * rme_platform_rv64v.h). The init captbl now has RME_RV64V_INIT_CPT_SIZE
- * (64) entries, so slots 9..63 are free for the benchmark. */
-const RME_BOOT_BENCH_THD: u64 = 9;
-const RME_BOOT_BENCH_PGT_TOP: u64 = 10;
-const RME_BOOT_BENCH_PGT_SRAM: u64 = 11;
+ * (0..9 are CPT/PGT/PRC/TBL_THD/KFN/KOM/TBL_TIMER/TBL_INT/PGT_L1/PGT_L2,
+ * see rme_platform_rv64v.h). The init captbl has RME_RV64V_INIT_CPT_SIZE
+ * (64) entries, so slots 10..63 are free for the benchmark. */
+const RME_BOOT_BENCH_THD: u64 = 10;
+const RME_BOOT_BENCH_PGT_TOP: u64 = 11;
+const RME_BOOT_BENCH_PGT_SRAM: u64 = 12;
 
 /* Cross-process objects - each gets its own slot in the init captbl */
-const RME_BOOT_BENCH_CPT: u64 = 12;
-const RME_BOOT_BENCH_PGT_TOP_NEW: u64 = 13;
-const RME_BOOT_BENCH_PGT_L1: u64 = 14;
-const RME_BOOT_BENCH_PGT_L2: u64 = 15;
-const RME_BOOT_BENCH_PRC: u64 = 16;
-const RME_BOOT_BENCH_DIFF_THD: u64 = 17;
+const RME_BOOT_BENCH_CPT: u64 = 13;
+const RME_BOOT_BENCH_PGT_TOP_NEW: u64 = 14;
+const RME_BOOT_BENCH_PGT_L1: u64 = 15;
+const RME_BOOT_BENCH_PGT_L2: u64 = 16;
+const RME_BOOT_BENCH_PRC: u64 = 17;
+const RME_BOOT_BENCH_DIFF_THD: u64 = 18;
 
 /* Slots inside the NEW process's own capability table. Per the RME manual,
  * every process has an independent capability-ID namespace: the cross-process
@@ -55,11 +55,11 @@ const RME_BENCH_NEW_CPT_THD: u64 = 0;
 const RME_BENCH_NEW_CPT_INIT_THD: u64 = 1;
 
 /* Kernel memory frontier for the newly created objects - relative to the
- * init KOM capability's Begin (RME_KOM_VA_BASE). The kernel's own boot-time
- * objects (init captbl, 3 Sv39 page tables, init thread) occupy roughly the
- * first 20KB of KOM, so the benchmark starts allocating at 0x8000 (32KB) to
- * stay clear of them. */
-const RME_BOOT_BENCH_KOM_FRONTIER: u64 = 0x8000;
+ * init KOM capability's Begin (RME_KOM_VA_BASE). The kernel's boot-time
+ * objects (init captbl, 3 Sv39 page tables, 8 per-CPU threads and 2 endpoint
+ * tables) occupy the first part of KOM, so the benchmark starts allocating at
+ * 0x10000 (64KB) to stay clear of them. */
+const RME_BOOT_BENCH_KOM_FRONTIER: u64 = 0x10000;
 
 /* The stack safe size */
 const RME_STACK_SAFE_SIZE: u64 = 16;
@@ -85,10 +85,10 @@ const RME_RV64V_IMAGE_PAGES: u64 = 16;
 /* Include *******************************************************************/
 use crate::syscall::{
     RME_BOOT_INIT_CPT, RME_BOOT_INIT_KFN, RME_BOOT_INIT_KOM, RME_BOOT_INIT_PGT_L2,
-    RME_BOOT_INIT_PRC, RME_BOOT_INIT_THD, RME_CID_NULL, RME_KFN_DEBUG_PRINT, RME_PGT_ALL_DYN,
-    RME_PGT_ALL_PERM, RME_PGT_NUM_512, RME_PGT_SIZE_1G, RME_PGT_SIZE_2M, RME_PGT_SIZE_4K,
-    RME_SVC_CPT_ADD, RME_SVC_CPT_CRT, RME_SVC_KFN, RME_SVC_PGT_ADD, RME_SVC_PGT_CON,
-    RME_SVC_PGT_CRT, RME_SVC_PRC_CRT, RME_SVC_THD_CRT, RME_SVC_THD_EXEC_SET,
+    RME_BOOT_INIT_PRC, RME_BOOT_INIT_THD, RME_BOOT_TBL_THD, RME_CID_NULL, RME_KFN_DEBUG_PRINT,
+    RME_PGT_ALL_DYN, RME_PGT_ALL_PERM, RME_PGT_NUM_512, RME_PGT_SIZE_1G, RME_PGT_SIZE_2M,
+    RME_PGT_SIZE_4K, RME_SVC_CPT_ADD, RME_SVC_CPT_CRT, RME_SVC_KFN, RME_SVC_PGT_ADD,
+    RME_SVC_PGT_CON, RME_SVC_PGT_CRT, RME_SVC_PRC_CRT, RME_SVC_THD_CRT, RME_SVC_THD_EXEC_SET,
     RME_SVC_THD_SCHED_BIND, RME_SVC_THD_SWT, RME_SVC_THD_TIME_XFER, RME_THD_FLAG_ALL,
     RME_THD_FLAG_SWT, rme_param_d0, rme_param_d1, rme_param_q0, rme_param_q1, rme_syscall,
 };
@@ -134,7 +134,7 @@ Output      : None.
 Return      : None.
 ******************************************************************************/
 #[inline(always)]
-fn rme_print_char(ch: u8) {
+pub fn rme_print_char(ch: u8) {
     /* Param0 = (Sub_ID << 32) | Func_ID */
     let param0: u64 = ((ch as u64) << 32) | RME_KFN_DEBUG_PRINT;
 
@@ -571,7 +571,7 @@ pub fn rme_diff_prc_thd_switch_test() -> ! {
         RME_SVC_CPT_ADD,
         RME_BOOT_INIT_CPT,
         rme_param_d1(RME_BOOT_BENCH_CPT) | rme_param_d0(RME_BENCH_NEW_CPT_INIT_THD),
-        rme_param_d1(RME_BOOT_INIT_CPT) | rme_param_d0(RME_BOOT_INIT_THD),
+        rme_param_d1(RME_BOOT_TBL_THD) | rme_param_d0(0),
         /* Only SWT: the boot init-thread cap lacks EXEC_SET/SCHED_CHILD/
          * SCHED_FREE, so RME_THD_FLAG_ALL is not a valid subset and would be
          * rejected with RME_ERR_CPT_FLAG. The cross-process thread only ever

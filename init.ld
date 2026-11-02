@@ -8,8 +8,7 @@ Description : The linker script for the user-mode init program, mirroring the
               QEMU loads the raw binary at the physical 0x81030000 (see the
               kernel's qemu.sh), but the program is linked and runs at the
               user virtual address 0x20000000 (same as X64); the kernel maps
-              it and its stack (VA 0x201F0000..0x20200000) onto the physical
-              pages.
+              it and the per-CPU user stacks in [0x20180000, 0x20200000).
 ******************************************************************************/
 
 OUTPUT_FORMAT("elf64-littleriscv")

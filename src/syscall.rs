@@ -123,13 +123,19 @@ pub const RME_KFN_DEBUG_DBP_MOD: RmePtr = 0xF806;
 /* Boot capability slots (mirror of rme_platform_rv64v.h) ********************/
 pub const RME_BOOT_INIT_CPT: RmePtr = 0;
 pub const RME_BOOT_INIT_PGT: RmePtr = 1;
-pub const RME_BOOT_INIT_PGT_L1: RmePtr = 7;
-pub const RME_BOOT_INIT_PGT_L2: RmePtr = 8;
 pub const RME_BOOT_INIT_PRC: RmePtr = 2;
-pub const RME_BOOT_INIT_THD: RmePtr = 3;
+/* Per-CPU initial-thread capability table */
+pub const RME_BOOT_TBL_THD: RmePtr = 3;
 pub const RME_BOOT_INIT_KFN: RmePtr = 4;
 pub const RME_BOOT_INIT_KOM: RmePtr = 5;
-pub const RME_BOOT_INIT_VCT: RmePtr = 6;
+pub const RME_BOOT_TBL_TIMER: RmePtr = 6;
+pub const RME_BOOT_TBL_INT: RmePtr = 7;
+pub const RME_BOOT_INIT_PGT_L1: RmePtr = 8;
+pub const RME_BOOT_INIT_PGT_L2: RmePtr = 9;
+/* Two-level capability encoding: (Table << 16) | 2L | Slot */
+pub const RME_CID_2L: RmePtr = 1 << 15;
+/* CPU0's initial thread lives in RME_BOOT_TBL_THD slot 0 */
+pub const RME_BOOT_INIT_THD: RmePtr = (RME_BOOT_TBL_THD << 16) | RME_CID_2L;
 /* The null capability ID - high bit of the D1 field */
 pub const RME_CID_NULL: RmePtr = 0x80000000;
 

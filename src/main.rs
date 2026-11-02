@@ -26,7 +26,7 @@ mod syscall;
 
 use core::panic::PanicInfo;
 
-use benchmark::rme_benchmark;
+use benchmark::{rme_benchmark, rme_print_char};
 /* End Include ***************************************************************/
 
 /* Entry:_start ***************************************************************
@@ -55,6 +55,10 @@ _start:
     LA                  gp,__global_pointer$
     .option pop
 
+    /* Only CPU0 owns the shared .bss. Secondary cores share the same address
+     * space and must not clear it while CPU0 is running the benchmark. */
+    BNEZ                a0,2f
+
     /* Zero the .bss section */
     LA                  a1,__bss_start
     LA                  a2,__bss_end
@@ -65,7 +69,8 @@ _start:
     BNE                 a1,a2,1b
 2:
 
-    /* Call the Rust main function */
+    /* Call the Rust main function. a0 still holds the CPUID passed by the
+     * kernel in __RME_User_Enter and becomes main's first argument. */
     CALL                main
 
     /* main returned - should never happen; idle forever */
@@ -77,15 +82,30 @@ _start:
 
 /* Function:main **************************************************************
 Description : The entry point of the init program. The assembly bootstrap in
-              _start sets up the runtime environment, then calls this
-              function. Runs the thread-switch benchmark, then idles forever.
-Input       : None.
+              _start leaves the CPUID passed by the kernel in a0. CPU0 runs the
+              thread-switch benchmark; all secondary cores print a-z once and
+              then idle. This keeps the benchmark's static data single-owner
+              while still proving that every hart reaches user mode.
+Input       : cpuid - The logical CPU index passed in a0 by the kernel.
 Output      : None.
 Return      : ! - This function never returns.
 ******************************************************************************/
 #[unsafe(no_mangle)]
-pub extern "C" fn main() -> ! {
-    rme_benchmark()
+pub extern "C" fn main(cpuid: u64) -> ! {
+    if cpuid == 0 {
+        rme_benchmark()
+    }
+
+    /* Secondary cores: print a-z once, then idle */
+    let mut ch: u8 = b'a';
+    while ch <= b'z' {
+        rme_print_char(ch);
+        ch += 1;
+    }
+    rme_print_char(b'\r');
+    rme_print_char(b'\n');
+
+    loop {}
 }
 /* End Function:main *********************************************************/
 
