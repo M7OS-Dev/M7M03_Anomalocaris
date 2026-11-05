@@ -120,22 +120,88 @@ pub const RME_KFN_DEBUG_MODE_MOD: RmePtr = 0xF804;
 pub const RME_KFN_DEBUG_IBP_MOD: RmePtr = 0xF805;
 pub const RME_KFN_DEBUG_DBP_MOD: RmePtr = 0xF806;
 
+/* Signal endpoint flags (mirror of Include/rme.h) *****************************/
+pub const RME_SIG_FLAG_SND: RmePtr = 1 << 0;
+pub const RME_SIG_FLAG_RCV_BS: RmePtr = 1 << 1;
+pub const RME_SIG_FLAG_RCV_BM: RmePtr = 1 << 2;
+pub const RME_SIG_FLAG_RCV_NS: RmePtr = 1 << 3;
+pub const RME_SIG_FLAG_RCV_NM: RmePtr = 1 << 4;
+pub const RME_SIG_FLAG_SCHED: RmePtr = 1 << 5;
+pub const RME_SIG_FLAG_ALL: RmePtr = RME_SIG_FLAG_SND
+    | RME_SIG_FLAG_RCV_BS
+    | RME_SIG_FLAG_RCV_BM
+    | RME_SIG_FLAG_RCV_NS
+    | RME_SIG_FLAG_RCV_NM
+    | RME_SIG_FLAG_SCHED;
+
+/* Receive options (mirror of Include/rme.h) **********************************/
+pub const RME_RCV_BS: RmePtr = 0;
+pub const RME_RCV_BM: RmePtr = 1;
+pub const RME_RCV_NS: RmePtr = 2;
+pub const RME_RCV_NM: RmePtr = 3;
+
+/* Invocation stub flags (mirror of Include/rme.h) ****************************/
+pub const RME_INV_FLAG_SET: RmePtr = 1 << 0;
+pub const RME_INV_FLAG_ACT: RmePtr = 1 << 1;
+pub const RME_INV_FLAG_ALL: RmePtr = RME_INV_FLAG_SET | RME_INV_FLAG_ACT;
+
+/* Capability table flags (mirror of Include/rme.h) ***************************/
+pub const RME_CPT_FLAG_CRT: RmePtr = 1 << 0;
+pub const RME_CPT_FLAG_DEL: RmePtr = 1 << 1;
+pub const RME_CPT_FLAG_FRZ: RmePtr = 1 << 2;
+pub const RME_CPT_FLAG_ADD_SRC: RmePtr = 1 << 3;
+pub const RME_CPT_FLAG_ADD_DST: RmePtr = 1 << 4;
+pub const RME_CPT_FLAG_REM: RmePtr = 1 << 5;
+pub const RME_CPT_FLAG_PRC_CRT: RmePtr = 1 << 6;
+pub const RME_CPT_FLAG_PRC_CPT: RmePtr = 1 << 7;
+pub const RME_CPT_FLAG_ALL: RmePtr = RME_CPT_FLAG_CRT
+    | RME_CPT_FLAG_DEL
+    | RME_CPT_FLAG_FRZ
+    | RME_CPT_FLAG_ADD_SRC
+    | RME_CPT_FLAG_ADD_DST
+    | RME_CPT_FLAG_REM
+    | RME_CPT_FLAG_PRC_CRT
+    | RME_CPT_FLAG_PRC_CPT;
+
+/* Process flags (mirror of Include/rme.h) ************************************/
+pub const RME_PRC_FLAG_INV: RmePtr = 1 << 0;
+pub const RME_PRC_FLAG_THD: RmePtr = 1 << 1;
+pub const RME_PRC_FLAG_CPT: RmePtr = 1 << 2;
+pub const RME_PRC_FLAG_PGT: RmePtr = 1 << 3;
+pub const RME_PRC_FLAG_ALL: RmePtr =
+    RME_PRC_FLAG_INV | RME_PRC_FLAG_THD | RME_PRC_FLAG_CPT | RME_PRC_FLAG_PGT;
+
+/* Kernel memory flags (mirror of Include/rme.h) ******************************/
+pub const RME_KOM_FLAG_CPT: RmePtr = 1 << 0;
+pub const RME_KOM_FLAG_PGT: RmePtr = 1 << 1;
+pub const RME_KOM_FLAG_THD: RmePtr = 1 << 2;
+pub const RME_KOM_FLAG_INV: RmePtr = 1 << 3;
+pub const RME_KOM_FLAG_ALL: RmePtr =
+    RME_KOM_FLAG_CPT | RME_KOM_FLAG_PGT | RME_KOM_FLAG_THD | RME_KOM_FLAG_INV;
+
 /* Boot capability slots (mirror of rme_platform_rv64v.h) ********************/
 pub const RME_BOOT_INIT_CPT: RmePtr = 0;
 pub const RME_BOOT_INIT_PGT: RmePtr = 1;
 pub const RME_BOOT_INIT_PRC: RmePtr = 2;
-/* Per-CPU initial-thread capability table */
+/* The per-CPU initial-thread capability table - one initial thread per hart.
+ * The init thread of CPU0 therefore lives in slot 0 of this table, which
+ * makes its capability ID two-level. */
 pub const RME_BOOT_TBL_THD: RmePtr = 3;
 pub const RME_BOOT_INIT_KFN: RmePtr = 4;
 pub const RME_BOOT_INIT_KOM: RmePtr = 5;
+/* The per-CPU timer and general-interrupt endpoint tables */
 pub const RME_BOOT_TBL_TIMER: RmePtr = 6;
 pub const RME_BOOT_TBL_INT: RmePtr = 7;
 pub const RME_BOOT_INIT_PGT_L1: RmePtr = 8;
 pub const RME_BOOT_INIT_PGT_L2: RmePtr = 9;
 /* Two-level capability encoding: (Table << 16) | 2L | Slot */
 pub const RME_CID_2L: RmePtr = 1 << 15;
-/* CPU0's initial thread lives in RME_BOOT_TBL_THD slot 0 */
+/* CPU0's initial thread: slot 0 of the per-CPU thread table */
 pub const RME_BOOT_INIT_THD: RmePtr = (RME_BOOT_TBL_THD << 16) | RME_CID_2L;
+/* The init thread's slot *inside* RME_BOOT_TBL_THD. CPT_ADD/REM address a
+ * capability with one-level IDs, so they need this slot number and the table
+ * slot, not the two-level RME_BOOT_INIT_THD. */
+pub const RME_BOOT_INIT_THD_SLOT: RmePtr = 0;
 /* The null capability ID - high bit of the D1 field */
 pub const RME_CID_NULL: RmePtr = 0x80000000;
 
@@ -277,6 +343,340 @@ pub fn rme_syscall(
     ret
 }
 /* End Function:rme_syscall **************************************************/
+
+/* Function:rme_cid_2l *******************************************************
+Description : Build a two-level capability ID: the major capability ID is the
+              capability table slot that holds the target capability, and the
+              minor one is the target capability's slot inside that table.
+              This mirrors the kernel's RME_CID(X,Y) macro.
+Input       : table - The capability table slot holding the target capability.
+              slot - The target capability's slot inside that table.
+Output      : None.
+Return      : RmePtr - The two-level capability ID.
+*****************************************************************************/
+#[inline(always)]
+pub const fn rme_cid_2l(table: RmePtr, slot: RmePtr) -> RmePtr {
+    (table << 16) | RME_CID_2L | slot
+}
+/* End Function:rme_cid_2l **************************************************/
+
+/* Function:rme_thd_swt *******************************************************
+Description : Switch to another thread. The target must have the same
+              preemptive priority, be bound to the same core, and have time
+              left. This is the RME equivalent of the Ammonite benchmark's
+              RVM_Thd_Swt.
+Input       : cap_thd - The capability to the target thread (two-level).
+              is_yield - Non-zero to give up all of the caller's timeslices.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_thd_swt(cap_thd: RmePtr, is_yield: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_THD_SWT, 0, cap_thd, is_yield, 0)
+}
+/* End Function:rme_thd_swt **************************************************/
+
+/* Function:rme_thd_crt *******************************************************
+Description : Create a thread. The capability is created in the capability
+              table given by the major capability ID.
+Input       : cap_cpt - The capability table to create the thread capability in.
+              cap_kom - The kernel memory capability used for the thread object.
+              cap_thd - The capability slot to create the thread capability in.
+              cap_prc - The process the thread belongs to.
+              prio_max - The maximum preemptive priority the thread may have.
+              raddr - The relative kernel memory address of the thread object.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_thd_crt(
+    cap_cpt: RmePtr,
+    cap_kom: RmePtr,
+    cap_thd: RmePtr,
+    cap_prc: RmePtr,
+    prio_max: RmePtr,
+    raddr: RmePtr,
+) -> RmePtr {
+    rme_syscall(
+        RME_SVC_THD_CRT,
+        cap_cpt,
+        rme_param_d1(cap_kom) | rme_param_d0(cap_thd),
+        rme_param_d1(cap_prc) | rme_param_d0(prio_max),
+        raddr,
+    )
+}
+/* End Function:rme_thd_crt **************************************************/
+
+/* Function:rme_thd_sched_bind ***********************************************
+Description : Bind a thread to the current processor and nominate its
+              scheduler.
+Input       : cap_thd - The capability to the thread (two-level).
+              cap_sched - The capability to the scheduler thread (two-level).
+              cap_sig - The capability to the scheduling notification endpoint.
+              tid - The thread ID to assign.
+              prio - The preemptive priority of the thread.
+              haddr - The hypervisor address of the thread (unused here).
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_thd_sched_bind(
+    cap_thd: RmePtr,
+    cap_sched: RmePtr,
+    cap_sig: RmePtr,
+    tid: RmePtr,
+    prio: RmePtr,
+    haddr: RmePtr,
+) -> RmePtr {
+    rme_syscall(
+        RME_SVC_THD_SCHED_BIND,
+        cap_thd,
+        rme_param_d1(cap_sched) | rme_param_d0(cap_sig),
+        rme_param_d1(tid) | rme_param_d0(prio),
+        haddr,
+    )
+}
+/* End Function:rme_thd_sched_bind *******************************************/
+
+/* Function:rme_thd_exec_set *************************************************
+Description : Set a thread's entry point, stack pointer and initial argument.
+              The argument lands in a0, which is how the benchmark tells the
+              freshly started helper thread which role it has to play.
+Input       : cap_thd - The capability to the thread (two-level).
+              entry - The entry point address.
+              stack - The stack pointer.
+              param - The argument passed in a0.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_thd_exec_set(cap_thd: RmePtr, entry: RmePtr, stack: RmePtr, param: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_THD_EXEC_SET, cap_thd, entry, stack, param)
+}
+/* End Function:rme_thd_exec_set **********************************************/
+
+/* Function:rme_thd_time_xfer ************************************************
+Description : Transfer timeslices from one thread to another.
+Input       : cap_dst - The capability to the receiving thread (two-level).
+              cap_src - The capability to the donating thread (two-level).
+              time - The number of timeslices to transfer.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_thd_time_xfer(cap_dst: RmePtr, cap_src: RmePtr, time: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_THD_TIME_XFER, 0, cap_dst, cap_src, time)
+}
+/* End Function:rme_thd_time_xfer ********************************************/
+
+/* Function:rme_thd_sched_rcv ************************************************
+Description : Poll the scheduler notification queue of a thread. This is the
+              user visible trace of the kernel's tick preemption: when a
+              thread runs out of timeslices the kernel notifies its scheduler.
+              The call returns immediately with RME_ERR_PTH_NOTIF when there
+              is nothing to report.
+Input       : cap_thd - The capability to the scheduler thread (two-level).
+Output      : None.
+Return      : RmePtr - The kernel return value, or the notification on success.
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_thd_sched_rcv(cap_thd: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_THD_SCHED_RCV, 0, cap_thd, 0, 0)
+}
+/* End Function:rme_thd_sched_rcv ********************************************/
+
+/* Function:rme_sig_crt *******************************************************
+Description : Create a signal endpoint in a capability table.
+Input       : cap_cpt - The capability table to create the endpoint in.
+              cap_sig - The capability slot to create the endpoint in.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_sig_crt(cap_cpt: RmePtr, cap_sig: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_SIG_CRT, cap_cpt, cap_sig, 0, 0)
+}
+/* End Function:rme_sig_crt ***************************************************/
+
+/* Function:rme_sig_snd *******************************************************
+Description : Send signals to a signal endpoint. When the receiver is blocked
+              on the same core, the kernel makes it runnable again.
+Input       : cap_sig - The capability to the signal endpoint (two-level).
+              number - The number of signals to send.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_sig_snd(cap_sig: RmePtr, number: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_SIG_SND, 0, cap_sig, number, 0)
+}
+/* End Function:rme_sig_snd ***************************************************/
+
+/* Function:rme_sig_rcv *******************************************************
+Description : Receive from a signal endpoint.
+Input       : cap_sig - The capability to the signal endpoint (two-level).
+              option - The receive option (RME_RCV_BM blocks, RME_RCV_NM does
+                       not block).
+Output      : None.
+Return      : RmePtr - The number of signals received, or an error code.
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_sig_rcv(cap_sig: RmePtr, option: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_SIG_RCV, 0, cap_sig, option, 0)
+}
+/* End Function:rme_sig_rcv ***************************************************/
+
+/* Function:rme_inv_crt *******************************************************
+Description : Create an invocation stub bound to a target process.
+Input       : cap_cpt - The capability table to create the stub capability in.
+              cap_kom - The kernel memory capability for the stub object.
+              cap_inv - The capability slot to create the stub capability in.
+              cap_prc - The target process that the invocation enters.
+              raddr - The relative kernel memory address of the stub object.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_inv_crt(
+    cap_cpt: RmePtr,
+    cap_kom: RmePtr,
+    cap_inv: RmePtr,
+    cap_prc: RmePtr,
+    raddr: RmePtr,
+) -> RmePtr {
+    rme_syscall(
+        RME_SVC_INV_CRT,
+        cap_cpt,
+        rme_param_d1(cap_kom) | rme_param_d0(cap_inv),
+        cap_prc,
+        raddr,
+    )
+}
+/* End Function:rme_inv_crt ***************************************************/
+
+/* Function:rme_inv_set *******************************************************
+Description : Set an invocation stub's entry point and stack.
+Input       : cap_inv - The capability to the invocation stub (two-level).
+              entry - The entry point address.
+              stack - The stack pointer.
+              is_exc_ret - Non-zero to return from the invocation on a fault.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_inv_set(cap_inv: RmePtr, entry: RmePtr, stack: RmePtr, is_exc_ret: RmePtr) -> RmePtr {
+    rme_syscall(
+        RME_SVC_INV_SET,
+        0,
+        rme_param_d0(cap_inv) | rme_param_d1(is_exc_ret),
+        entry,
+        stack,
+    )
+}
+/* End Function:rme_inv_set ***************************************************/
+
+/* Function:rme_inv_act *******************************************************
+Description : Activate an invocation stub. The kernel switches the caller to
+              the stub's entry point, running in the target process' address
+              space. The callee returns with rme_inv_ret().
+Input       : cap_inv - The capability to the invocation stub (two-level).
+              param - The argument passed to the callee in a0.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_inv_act(cap_inv: RmePtr, param: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_INV_ACT, 0, cap_inv, param, 0)
+}
+/* End Function:rme_inv_act ***************************************************/
+
+/* Function:rme_inv_ret *******************************************************
+Description : Return from a synchronous invocation.
+Input       : retval - The value returned to the invoker.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_inv_ret(retval: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_INV_RET, 0, retval, 0, 0)
+}
+/* End Function:rme_inv_ret ***************************************************/
+
+/* Function:rme_cpt_crt *******************************************************
+Description : Create a capability table.
+Input       : cap_cpt - The capability table to create the new table in.
+              cap_kom - The kernel memory capability for the table object.
+              cap_crt - The capability slot to create the new table in.
+              raddr - The relative kernel memory address of the table object.
+              entry_num - The number of entries in the new table.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_cpt_crt(
+    cap_cpt: RmePtr,
+    cap_kom: RmePtr,
+    cap_crt: RmePtr,
+    raddr: RmePtr,
+    entry_num: RmePtr,
+) -> RmePtr {
+    rme_syscall(
+        RME_SVC_CPT_CRT,
+        cap_cpt,
+        rme_param_d1(cap_kom) | rme_param_d0(cap_crt),
+        raddr,
+        entry_num,
+    )
+}
+/* End Function:rme_cpt_crt ***************************************************/
+
+/* Function:rme_cpt_add *******************************************************
+Description : Delegate a capability from one capability table into another.
+Input       : cap_cpt_dst - The destination capability table (two-level).
+              cap_dst - The destination slot inside that table.
+              cap_cpt_src - The source capability table (two-level).
+              cap_src - The source slot inside that table.
+              flag - The subset of the source's rights to delegate.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_cpt_add(
+    cap_cpt_dst: RmePtr,
+    cap_dst: RmePtr,
+    cap_cpt_src: RmePtr,
+    cap_src: RmePtr,
+    flag: RmePtr,
+) -> RmePtr {
+    rme_syscall(
+        RME_SVC_CPT_ADD,
+        0,
+        rme_param_d1(cap_cpt_dst) | rme_param_d0(cap_dst),
+        rme_param_d1(cap_cpt_src) | rme_param_d0(cap_src),
+        flag,
+    )
+}
+/* End Function:rme_cpt_add ***************************************************/
+
+/* Function:rme_prc_crt *******************************************************
+Description : Create a process.
+Input       : cap_cpt - The capability table to create the process in.
+              cap_prc - The capability slot to create the process in.
+              cap_cpt_new - The capability table owned by the new process.
+              cap_pgt - The root page table owned by the new process.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_prc_crt(
+    cap_cpt: RmePtr,
+    cap_prc: RmePtr,
+    cap_cpt_new: RmePtr,
+    cap_pgt: RmePtr,
+) -> RmePtr {
+    rme_syscall(RME_SVC_PRC_CRT, cap_cpt, cap_prc, cap_cpt_new, cap_pgt)
+}
+/* End Function:rme_prc_crt ***************************************************/
 
 /* End Of File ***************************************************************/
 

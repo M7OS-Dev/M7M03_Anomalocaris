@@ -5,9 +5,10 @@ Date        : 13/10/2026
 Licence     : The Unlicense; see LICENSE for details.
 Description : The first user-mode program (init) for the RV64V port on
               QEMU virt, written in Rust. Runs in U-mode as the init thread,
-              entered by the kernel via __RME_User_Enter. Runs the thread-switch
-              benchmark (a Rust port of rme_benchmark.c), then idles in a busy
-              loop (WFI is an illegal instruction on QEMU).
+              entered by the kernel via __RME_User_Enter. Runs the standard
+              RVM benchmark suite (a Rust port of rme_benchmark.c, mirroring
+              the scenario list of the Ammonite rvm_benchmark.h), then idles
+              in a busy loop (WFI is an illegal instruction on QEMU).
               This is the init program (first user process) for the RV64V port
               of the RME microkernel (M7M01_Eukaron), written in Rust. The
               kernel's Project/GCC-RV64V build invokes this project's build.sh
@@ -33,14 +34,17 @@ use benchmark::{rme_benchmark, rme_print_char};
 Description : The assembly entry point of the user-mode init program,
               mirroring the C start.S. The kernel's __RME_User_Enter srets
               here with:
-                sp = INIT_STACK (0x20200000), a0 = CPUID, sstatus.SPIE set
-                (U-mode).
+                sp = this CPU's initial user stack, a0 = CPUID,
+                sstatus.SPIE set (U-mode).
               Sets up the runtime environment (gp, .bss), then calls main() -
               the standard RISC-V freestanding bootstrap.
               No .data relocation is needed: the kernel maps the program's
               virtual window straight onto the physical pages the loader
               filled, so the linked (virtual) addresses and the loaded
               (physical) bytes line up.
+              Every hart of the SMP port enters this same program in the same
+              address space, so only CPU0 owns the shared .bss; the secondary
+              harts must not clear it while CPU0 is running the benchmark.
 ******************************************************************************/
 core::arch::global_asm!(
     r#"
@@ -55,8 +59,7 @@ _start:
     LA                  gp,__global_pointer$
     .option pop
 
-    /* Only CPU0 owns the shared .bss. Secondary cores share the same address
-     * space and must not clear it while CPU0 is running the benchmark. */
+    /* Only CPU0 owns the shared .bss */
     BNEZ                a0,2f
 
     /* Zero the .bss section */
@@ -69,8 +72,8 @@ _start:
     BNE                 a1,a2,1b
 2:
 
-    /* Call the Rust main function. a0 still holds the CPUID passed by the
-     * kernel in __RME_User_Enter and becomes main's first argument. */
+    /* Call the Rust main function. a0 still holds the CPUID the kernel passed
+     * in __RME_User_Enter and becomes main's first argument. */
     CALL                main
 
     /* main returned - should never happen; idle forever */
@@ -81,11 +84,10 @@ _start:
 /* End Entry:_start **********************************************************/
 
 /* Function:main **************************************************************
-Description : The entry point of the init program. The assembly bootstrap in
-              _start leaves the CPUID passed by the kernel in a0. CPU0 runs the
-              thread-switch benchmark; all secondary cores print a-z once and
-              then idle. This keeps the benchmark's static data single-owner
-              while still proving that every hart reaches user mode.
+Description : The entry point of the init program. CPU0 runs the benchmark
+              suite, whose static data has a single owner; every secondary
+              hart prints a-z once and then idles, which still proves that all
+              harts reach user mode.
 Input       : cpuid - The logical CPU index passed in a0 by the kernel.
 Output      : None.
 Return      : ! - This function never returns.
@@ -96,7 +98,7 @@ pub extern "C" fn main(cpuid: u64) -> ! {
         rme_benchmark()
     }
 
-    /* Secondary cores: print a-z once, then idle */
+    /* Secondary harts: print a-z once, then idle */
     let mut ch: u8 = b'a';
     while ch <= b'z' {
         rme_print_char(ch);

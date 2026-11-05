@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Yang Hongyun <2805457044@qq.com>"]
 license = "Unlicense"
-description = "The first user-mode program (init) for the RV64V port of the RME microkernel (M7M01_Eukaron), written in Rust. Runs in U-mode as the init thread on QEMU virt."
+description = "The first user-mode program (init) for the RV64V port of the RME microkernel (M7M01_Eukaron), written in Rust. Runs in U-mode as the init thread on QEMU virt, and hosts the standard RVM benchmark suite (a Rust port of rme_benchmark.c)."
 
 # Name the built ELF "init" so the raw binary is naturally "init.bin",
 # matching the C init program it replaces in the kernel repository.
