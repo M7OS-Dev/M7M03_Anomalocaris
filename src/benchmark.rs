@@ -312,40 +312,6 @@ fn bench_read_cycle() -> u64 {
 }
 /* End Function:bench_read_cycle ***********************************************/
 
-/* Function:bench_read_time **************************************************
-Description : Read the RISC-V time CSR. The kernel's capability quiescence
-              check uses this counter, not the cycle counter.
-Input       : None.
-Output      : None.
-Return      : u64 - The current time value.
-*****************************************************************************/
-#[inline(always)]
-fn bench_read_time() -> u64 {
-    let time: u64;
-    unsafe {
-        core::arch::asm!("csrr {0}, time", out(reg) time, options(nostack));
-    }
-    time
-}
-/* End Function:bench_read_time **********************************************/
-
-/* Function:bench_wait_quiesce ***********************************************
-Description : Wait until the time CSR advances. A capability can only be
-              frozen after at least one time tick has passed since it was
-              created or delegated.
-Input       : None.
-Output      : None.
-Return      : None.
-*****************************************************************************/
-#[inline(always)]
-fn bench_wait_quiesce() {
-    let start = bench_read_time();
-    while bench_read_time() == start {
-        core::hint::spin_loop();
-    }
-}
-/* End Function:bench_wait_quiesce *******************************************/
-
 /* Function:bench_kom_alloc **************************************************
 Description : Allocate a distinct KOM range for a kernel object. The address is
               relative to the KOM capability's Begin, as the kernel expects.
@@ -422,12 +388,13 @@ macro_rules! bench_print {
 /* End Macro:bench_print *****************************************************/
 
 /* Function:bench_setup_check ************************************************
-Description : Check the result of one setup system call. A failed setup is
-              fatal: the error is printed and the benchmark stops right
-              there, because the measurement environment is broken and every
-              test that follows would only produce misleading numbers. The
-              program spins forever instead of returning, because a user-mode
-              thread cannot be aborted from here.
+Description : Check the result of one setup system call of the global
+              preparation stage. A failed setup is fatal: the error is printed
+              and the benchmark stops right there, because the measurement
+              environment is broken and every test that follows would only
+              produce misleading numbers. The program spins forever instead of
+              returning, because a user-mode thread cannot be aborted from
+              here.
 Input       : label - The setup step name.
               ret - The value the setup system call returned.
 Output      : None.
@@ -446,6 +413,30 @@ fn bench_setup_check(label: &str, ret: RmePtr) {
     }
 }
 /* End Function:bench_setup_check *******************************************/
+
+/* Function:bench_setup_try **************************************************
+Description : Check the result of one setup system call of a single test. A
+              failed setup only fails that test: the error is recorded in the
+              statistics, so the caller can leave the test and the suite
+              continues with the next one.
+Input       : stat - The statistics accumulator of the current test.
+              label - The setup step name.
+              ret - The value the setup system call returned.
+Output      : None.
+Return      : bool - true when the call succeeded.
+*****************************************************************************/
+fn bench_setup_try(stat: &mut BenchStat, label: &str, ret: RmePtr) -> bool {
+    let signed = ret as i64;
+
+    if signed < 0 {
+        bench_print!("bench setup failed: {} ret={}\r\n", label, signed);
+        let _ = stat.set_ret(signed);
+        false
+    } else {
+        true
+    }
+}
+/* End Function:bench_setup_try *********************************************/
 
 /* Function:bench_phase_get **************************************************
 Description : Read the shared phase flag.
@@ -1806,8 +1797,14 @@ Output      : None.
 Return      : None.
 *****************************************************************************/
 fn bench_test_sig_snd(stat: &mut BenchStat) {
-    let _ = bench_sig_crt(CAP_BENCH_SIG_SND_ONLY);
-    bench_wait_quiesce();
+    if !bench_setup_try(
+        stat,
+        "SIG_CRT send-only",
+        bench_sig_crt(CAP_BENCH_SIG_SND_ONLY),
+    ) {
+        return;
+    }
+
     stat.reset();
 
     let mut count: u64 = 0;
@@ -1820,7 +1817,6 @@ fn bench_test_sig_snd(stat: &mut BenchStat) {
         count += 1;
     }
 
-    bench_wait_quiesce();
     let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_BENCH_SIG_SND_ONLY);
     let _ = rme_sig_del(RME_BOOT_INIT_CPT, CAP_BENCH_SIG_SND_ONLY);
 }
@@ -1834,11 +1830,13 @@ Output      : None.
 Return      : None.
 *****************************************************************************/
 fn bench_test_sig_rcv_only(stat: &mut BenchStat) {
-    bench_setup_check(
+    if !bench_setup_try(
+        stat,
         "SIG_CRT receive-only",
         bench_sig_crt(CAP_BENCH_SIG_RCV_ONLY),
-    );
-    bench_wait_quiesce();
+    ) {
+        return;
+    }
 
     /* Clear the shared slots before waking the helper: a failed wake-up
      * must not leave the previous helper test's data visible. */
@@ -1848,7 +1846,6 @@ fn bench_test_sig_rcv_only(stat: &mut BenchStat) {
     stat.load_shared();
     stat.require_count(BENCH_LOOP_NUM);
 
-    bench_wait_quiesce();
     let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_BENCH_SIG_RCV_ONLY);
     let _ = rme_sig_del(RME_BOOT_INIT_CPT, CAP_BENCH_SIG_RCV_ONLY);
 }
@@ -1896,7 +1893,14 @@ fn bench_test_inv_act(stat: &mut BenchStat) {
     let stack = bench_stack_top(unsafe {
         core::ptr::addr_of!(BENCH_STACK_INV2[BENCH_STACK_WORD_NUM - 1]) as u64
     });
-    let _ = rme_inv_set(cap_inv2, entry, stack, 0);
+    if !bench_setup_try(
+        stat,
+        "INV_SET one-way stub",
+        rme_inv_set(cap_inv2, entry, stack, 0),
+    ) {
+        return;
+    }
+
     stat.reset();
 
     let mut count: u64 = 0;
@@ -1931,8 +1935,21 @@ fn bench_test_inv_ret(stat: &mut BenchStat) {
     let stack2 = bench_stack_top(unsafe {
         core::ptr::addr_of!(BENCH_STACK_INV2[BENCH_STACK_WORD_NUM - 1]) as u64
     });
-    let _ = rme_inv_set(cap_inv1, entry1, stack1, 0);
-    let _ = rme_inv_set(cap_inv2, entry2, stack2, 0);
+    if !bench_setup_try(
+        stat,
+        "INV_SET nested outer stub",
+        rme_inv_set(cap_inv1, entry1, stack1, 0),
+    ) {
+        return;
+    }
+    if !bench_setup_try(
+        stat,
+        "INV_SET nested inner stub",
+        rme_inv_set(cap_inv2, entry2, stack2, 0),
+    ) {
+        return;
+    }
+
     stat.reset();
 
     let mut count: u64 = 0;
@@ -2182,18 +2199,31 @@ fn bench_test_tick_preempt(stat: &mut BenchStat) {
          * that the very next kernel tick preempts it. The helper thread is
          * parked at this point, and a parked thread only becomes runnable
          * again when it is woken up with a signal. */
-        bench_setup_check(
+        if !bench_setup_try(
+            stat,
             "THD_TIME_XFER revoke helper time",
             rme_thd_time_xfer(RME_BOOT_INIT_THD, cap_p1t2, u64::MAX),
-        );
-        bench_setup_check(
+        ) {
+            break;
+        }
+        if !bench_setup_try(
+            stat,
             "THD_TIME_XFER arm helper time",
             rme_thd_time_xfer(cap_p1t2, RME_BOOT_INIT_THD, 1),
-        );
+        ) {
+            /* The helper's budget was revoked, so give it back before the
+             * test is left. */
+            bench_stop_set(1);
+            let _ = rme_thd_time_xfer(cap_p1t2, RME_BOOT_INIT_THD, BENCH_TIME_XFER);
+            break;
+        }
         /* Wake the helper thread up - it latches the departure timestamp and
          * burns its timeslice until the next tick preempts it */
-        bench_setup_check("SIG_SND wake helper", rme_sig_snd(cap_park, 1));
-
+        if !bench_setup_try(stat, "SIG_SND wake helper", rme_sig_snd(cap_park, 1)) {
+            bench_stop_set(1);
+            let _ = rme_thd_time_xfer(cap_p1t2, RME_BOOT_INIT_THD, BENCH_TIME_XFER);
+            break;
+        }
         /* The tick preemption notifies this thread, as the helper's
          * scheduler. Bound the wait so a broken helper cannot hang the
          * whole suite. */
@@ -2256,7 +2286,6 @@ fn bench_test_cpt_crt(stat: &mut BenchStat) {
 
         stat.record((end - start) as u32);
 
-        bench_wait_quiesce();
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_CPT);
         let _ = rme_cpt_del(RME_BOOT_INIT_CPT, CAP_TEST_CPT);
         count += 1;
@@ -2277,14 +2306,19 @@ fn bench_test_cpt_del(stat: &mut BenchStat) {
     let mut count: u64 = 0;
     while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
         let raddr = bench_kom_alloc(16 * 64, 64);
-        let _ = rme_cpt_crt(
-            RME_BOOT_INIT_CPT,
-            RME_BOOT_INIT_KOM,
-            CAP_TEST_CPT,
-            raddr,
-            16,
-        );
-        bench_wait_quiesce();
+        if !bench_setup_try(
+            stat,
+            "CPT_CRT delete target",
+            rme_cpt_crt(
+                RME_BOOT_INIT_CPT,
+                RME_BOOT_INIT_KOM,
+                CAP_TEST_CPT,
+                raddr,
+                16,
+            ),
+        ) {
+            break;
+        }
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_CPT);
 
         let start = bench_read_cycle();
@@ -2309,8 +2343,9 @@ fn bench_test_cpt_frz(stat: &mut BenchStat) {
 
     let mut count: u64 = 0;
     while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let _ = bench_sig_crt(CAP_TEST_SIG);
-        bench_wait_quiesce();
+        if !bench_setup_try(stat, "SIG_CRT freeze target", bench_sig_crt(CAP_TEST_SIG)) {
+            break;
+        }
 
         let start = bench_read_cycle();
         let _ = stat.set_ret(rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_SIG) as i64);
@@ -2332,8 +2367,14 @@ Output      : None.
 Return      : None.
 *****************************************************************************/
 fn bench_test_cpt_add(stat: &mut BenchStat) {
-    let _ = bench_sig_crt(CAP_TEST_SIG2);
-    bench_wait_quiesce();
+    if !bench_setup_try(
+        stat,
+        "SIG_CRT delegate source",
+        bench_sig_crt(CAP_TEST_SIG2),
+    ) {
+        return;
+    }
+
     stat.reset();
 
     let mut count: u64 = 0;
@@ -2350,13 +2391,11 @@ fn bench_test_cpt_add(stat: &mut BenchStat) {
 
         stat.record((end - start) as u32);
 
-        bench_wait_quiesce();
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_SIG);
         let _ = rme_cpt_rem(RME_BOOT_INIT_CPT, CAP_TEST_SIG);
         count += 1;
     }
 
-    bench_wait_quiesce();
     let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_SIG2);
     let _ = rme_sig_del(RME_BOOT_INIT_CPT, CAP_TEST_SIG2);
 }
@@ -2370,20 +2409,31 @@ Output      : None.
 Return      : None.
 *****************************************************************************/
 fn bench_test_cpt_rem(stat: &mut BenchStat) {
-    let _ = bench_sig_crt(CAP_TEST_SIG2);
-    bench_wait_quiesce();
+    if !bench_setup_try(
+        stat,
+        "SIG_CRT delegate source",
+        bench_sig_crt(CAP_TEST_SIG2),
+    ) {
+        return;
+    }
+
     stat.reset();
 
     let mut count: u64 = 0;
     while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let _ = rme_cpt_add(
-            RME_BOOT_INIT_CPT,
-            CAP_TEST_SIG,
-            RME_BOOT_INIT_CPT,
-            CAP_TEST_SIG2,
-            RME_SIG_FLAG_ALL,
-        );
-        bench_wait_quiesce();
+        if !bench_setup_try(
+            stat,
+            "CPT_ADD delegate leaf",
+            rme_cpt_add(
+                RME_BOOT_INIT_CPT,
+                CAP_TEST_SIG,
+                RME_BOOT_INIT_CPT,
+                CAP_TEST_SIG2,
+                RME_SIG_FLAG_ALL,
+            ),
+        ) {
+            break;
+        }
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_SIG);
 
         let start = bench_read_cycle();
@@ -2394,7 +2444,6 @@ fn bench_test_cpt_rem(stat: &mut BenchStat) {
         count += 1;
     }
 
-    bench_wait_quiesce();
     let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_SIG2);
     let _ = rme_sig_del(RME_BOOT_INIT_CPT, CAP_TEST_SIG2);
 }
@@ -2419,7 +2468,6 @@ fn bench_test_pgt_crt(stat: &mut BenchStat) {
 
         stat.record((end - start) as u32);
 
-        bench_wait_quiesce();
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_PGT);
         let _ = rme_pgt_del(RME_BOOT_INIT_CPT, CAP_TEST_PGT);
         count += 1;
@@ -2440,8 +2488,13 @@ fn bench_test_pgt_del(stat: &mut BenchStat) {
     let mut count: u64 = 0;
     while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
         let raddr = bench_kom_alloc(0x1000, 0x1000);
-        let _ = bench_pgt_crt(CAP_TEST_PGT, raddr, 0, 0, RME_PGT_SIZE_4K);
-        bench_wait_quiesce();
+        if !bench_setup_try(
+            stat,
+            "PGT_CRT delete target",
+            bench_pgt_crt(CAP_TEST_PGT, raddr, 0, 0, RME_PGT_SIZE_4K),
+        ) {
+            break;
+        }
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_PGT);
 
         let start = bench_read_cycle();
@@ -2469,7 +2522,13 @@ fn bench_test_pgt_add(stat: &mut BenchStat) {
         /* PGT_REM is broken in the current kernel, so create a fresh table
          * for each round and delete it untimed instead of unmapping. */
         let raddr = bench_kom_alloc(0x1000, 0x1000);
-        let _ = bench_pgt_crt(CAP_TEST_PGT_DST, raddr, 0, 0, RME_PGT_SIZE_4K);
+        if !bench_setup_try(
+            stat,
+            "PGT_CRT map target",
+            bench_pgt_crt(CAP_TEST_PGT_DST, raddr, 0, 0, RME_PGT_SIZE_4K),
+        ) {
+            break;
+        }
 
         let start = bench_read_cycle();
         let _ = stat.set_ret(bench_pgt_add(CAP_TEST_PGT_DST, 0, RME_BOOT_INIT_PGT_L2, 0) as i64);
@@ -2477,7 +2536,6 @@ fn bench_test_pgt_add(stat: &mut BenchStat) {
 
         stat.record((end - start) as u32);
 
-        bench_wait_quiesce();
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_PGT_DST);
         let _ = rme_pgt_del(RME_BOOT_INIT_CPT, CAP_TEST_PGT_DST);
         count += 1;
@@ -2494,12 +2552,25 @@ Return      : None.
 *****************************************************************************/
 fn bench_test_pgt_rem(stat: &mut BenchStat) {
     let raddr = bench_kom_alloc(0x1000, 0x1000);
-    let _ = bench_pgt_crt(CAP_TEST_PGT_DST, raddr, 0, 0, RME_PGT_SIZE_4K);
+    if !bench_setup_try(
+        stat,
+        "PGT_CRT unmap target",
+        bench_pgt_crt(CAP_TEST_PGT_DST, raddr, 0, 0, RME_PGT_SIZE_4K),
+    ) {
+        return;
+    }
+
     stat.reset();
 
     let mut count: u64 = 0;
     while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let _ = bench_pgt_add(CAP_TEST_PGT_DST, 0, RME_BOOT_INIT_PGT_L2, 0);
+        if !bench_setup_try(
+            stat,
+            "PGT_ADD mapped page",
+            bench_pgt_add(CAP_TEST_PGT_DST, 0, RME_BOOT_INIT_PGT_L2, 0),
+        ) {
+            break;
+        }
 
         let start = bench_read_cycle();
         let _ = stat.set_ret(rme_pgt_rem(CAP_TEST_PGT_DST, 0) as i64);
@@ -2509,7 +2580,6 @@ fn bench_test_pgt_rem(stat: &mut BenchStat) {
         count += 1;
     }
 
-    bench_wait_quiesce();
     let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_PGT_DST);
     let _ = rme_pgt_del(RME_BOOT_INIT_CPT, CAP_TEST_PGT_DST);
 }
@@ -2524,20 +2594,32 @@ Return      : None.
 *****************************************************************************/
 fn bench_test_pgt_con(stat: &mut BenchStat) {
     let parent_raddr = bench_kom_alloc(0x1000, 0x1000);
-    let _ = bench_pgt_crt(CAP_TEST_PGT_CON_PARENT, parent_raddr, 0, 0, RME_PGT_SIZE_2M);
+    if !bench_setup_try(
+        stat,
+        "PGT_CRT connect parent",
+        bench_pgt_crt(CAP_TEST_PGT_CON_PARENT, parent_raddr, 0, 0, RME_PGT_SIZE_2M),
+    ) {
+        return;
+    }
 
     /* PGT_DES is broken in the current kernel, so each child can only be
      * connected once. Create one child per parent slot and connect each. */
     let mut i: u64 = 0;
     while i < BENCH_PGT_CON_ROUNDS {
         let child_raddr = bench_kom_alloc(0x1000, 0x1000);
-        let _ = bench_pgt_crt(
-            CAP_TEST_PGT_CHILD_BASE + i,
-            child_raddr,
-            i << RME_PGT_SIZE_2M,
-            0,
-            RME_PGT_SIZE_4K,
-        );
+        if !bench_setup_try(
+            stat,
+            "PGT_CRT connect child",
+            bench_pgt_crt(
+                CAP_TEST_PGT_CHILD_BASE + i,
+                child_raddr,
+                i << RME_PGT_SIZE_2M,
+                0,
+                RME_PGT_SIZE_4K,
+            ),
+        ) {
+            return;
+        }
         i += 1;
     }
 
@@ -2566,13 +2648,31 @@ Return      : None.
 fn bench_test_pgt_des(stat: &mut BenchStat) {
     let parent_raddr = bench_kom_alloc(0x1000, 0x1000);
     let child_raddr = bench_kom_alloc(0x1000, 0x1000);
-    let _ = bench_pgt_crt(CAP_TEST_PGT_PARENT, parent_raddr, 0, 0, RME_PGT_SIZE_2M);
-    let _ = bench_pgt_crt(CAP_TEST_PGT_CHILD, child_raddr, 0, 0, RME_PGT_SIZE_4K);
+    if !bench_setup_try(
+        stat,
+        "PGT_CRT disconnect parent",
+        bench_pgt_crt(CAP_TEST_PGT_PARENT, parent_raddr, 0, 0, RME_PGT_SIZE_2M),
+    ) {
+        return;
+    }
+    if !bench_setup_try(
+        stat,
+        "PGT_CRT disconnect child",
+        bench_pgt_crt(CAP_TEST_PGT_CHILD, child_raddr, 0, 0, RME_PGT_SIZE_4K),
+    ) {
+        return;
+    }
     stat.reset();
 
     let mut count: u64 = 0;
     while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let _ = bench_pgt_con(CAP_TEST_PGT_PARENT, 0, CAP_TEST_PGT_CHILD);
+        if !bench_setup_try(
+            stat,
+            "PGT_CON connected child",
+            bench_pgt_con(CAP_TEST_PGT_PARENT, 0, CAP_TEST_PGT_CHILD),
+        ) {
+            break;
+        }
 
         let start = bench_read_cycle();
         let _ = stat.set_ret(rme_pgt_des(CAP_TEST_PGT_PARENT, 0, CAP_TEST_PGT_CHILD) as i64);
@@ -2582,7 +2682,6 @@ fn bench_test_pgt_des(stat: &mut BenchStat) {
         count += 1;
     }
 
-    bench_wait_quiesce();
     let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_PGT_CHILD);
     let _ = rme_pgt_del(RME_BOOT_INIT_CPT, CAP_TEST_PGT_CHILD);
     let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_PGT_PARENT);
@@ -2600,14 +2699,26 @@ Return      : None.
 fn bench_test_prc_crt(stat: &mut BenchStat) {
     let cpt_raddr = bench_kom_alloc(16 * 64, 64);
     let pgt_raddr = bench_kom_alloc(0x1000, 0x1000);
-    let _ = rme_cpt_crt(
-        RME_BOOT_INIT_CPT,
-        RME_BOOT_INIT_KOM,
-        CAP_TEST_CPT,
-        cpt_raddr,
-        16,
-    );
-    let _ = bench_pgt_crt(CAP_TEST_PGT, pgt_raddr, 0, 1, RME_PGT_SIZE_1G);
+    if !bench_setup_try(
+        stat,
+        "CPT_CRT process captbl",
+        rme_cpt_crt(
+            RME_BOOT_INIT_CPT,
+            RME_BOOT_INIT_KOM,
+            CAP_TEST_CPT,
+            cpt_raddr,
+            16,
+        ),
+    ) {
+        return;
+    }
+    if !bench_setup_try(
+        stat,
+        "PGT_CRT process root",
+        bench_pgt_crt(CAP_TEST_PGT, pgt_raddr, 0, 1, RME_PGT_SIZE_1G),
+    ) {
+        return;
+    }
     stat.reset();
 
     let mut count: u64 = 0;
@@ -2621,13 +2732,11 @@ fn bench_test_prc_crt(stat: &mut BenchStat) {
 
         stat.record((end - start) as u32);
 
-        bench_wait_quiesce();
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_PRC);
         let _ = rme_prc_del(RME_BOOT_INIT_CPT, CAP_TEST_PRC);
         count += 1;
     }
 
-    bench_wait_quiesce();
     let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_CPT);
     let _ = rme_cpt_del(RME_BOOT_INIT_CPT, CAP_TEST_CPT);
     let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_PGT);
@@ -2645,20 +2754,37 @@ Return      : None.
 fn bench_test_prc_del(stat: &mut BenchStat) {
     let cpt_raddr = bench_kom_alloc(16 * 64, 64);
     let pgt_raddr = bench_kom_alloc(0x1000, 0x1000);
-    let _ = rme_cpt_crt(
-        RME_BOOT_INIT_CPT,
-        RME_BOOT_INIT_KOM,
-        CAP_TEST_CPT,
-        cpt_raddr,
-        16,
-    );
-    let _ = bench_pgt_crt(CAP_TEST_PGT, pgt_raddr, 0, 1, RME_PGT_SIZE_1G);
+    if !bench_setup_try(
+        stat,
+        "CPT_CRT process captbl",
+        rme_cpt_crt(
+            RME_BOOT_INIT_CPT,
+            RME_BOOT_INIT_KOM,
+            CAP_TEST_CPT,
+            cpt_raddr,
+            16,
+        ),
+    ) {
+        return;
+    }
+    if !bench_setup_try(
+        stat,
+        "PGT_CRT process root",
+        bench_pgt_crt(CAP_TEST_PGT, pgt_raddr, 0, 1, RME_PGT_SIZE_1G),
+    ) {
+        return;
+    }
     stat.reset();
 
     let mut count: u64 = 0;
     while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let _ = rme_prc_crt(RME_BOOT_INIT_CPT, CAP_TEST_PRC, CAP_TEST_CPT, CAP_TEST_PGT);
-        bench_wait_quiesce();
+        if !bench_setup_try(
+            stat,
+            "PRC_CRT process",
+            rme_prc_crt(RME_BOOT_INIT_CPT, CAP_TEST_PRC, CAP_TEST_CPT, CAP_TEST_PGT),
+        ) {
+            break;
+        }
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_PRC);
 
         let start = bench_read_cycle();
@@ -2669,7 +2795,6 @@ fn bench_test_prc_del(stat: &mut BenchStat) {
         count += 1;
     }
 
-    bench_wait_quiesce();
     let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_CPT);
     let _ = rme_cpt_del(RME_BOOT_INIT_CPT, CAP_TEST_CPT);
     let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_PGT);
@@ -2688,22 +2813,46 @@ fn bench_test_prc_cpt(stat: &mut BenchStat) {
     let cpt_a_raddr = bench_kom_alloc(16 * 64, 64);
     let cpt_b_raddr = bench_kom_alloc(16 * 64, 64);
     let pgt_raddr = bench_kom_alloc(0x1000, 0x1000);
-    let _ = rme_cpt_crt(
-        RME_BOOT_INIT_CPT,
-        RME_BOOT_INIT_KOM,
-        CAP_TEST_CPT,
-        cpt_a_raddr,
-        16,
-    );
-    let _ = rme_cpt_crt(
-        RME_BOOT_INIT_CPT,
-        RME_BOOT_INIT_KOM,
-        CAP_TEST_CPT2,
-        cpt_b_raddr,
-        16,
-    );
-    let _ = bench_pgt_crt(CAP_TEST_PGT, pgt_raddr, 0, 1, RME_PGT_SIZE_1G);
-    let _ = rme_prc_crt(RME_BOOT_INIT_CPT, CAP_TEST_PRC, CAP_TEST_CPT, CAP_TEST_PGT);
+    if !bench_setup_try(
+        stat,
+        "CPT_CRT switch target A",
+        rme_cpt_crt(
+            RME_BOOT_INIT_CPT,
+            RME_BOOT_INIT_KOM,
+            CAP_TEST_CPT,
+            cpt_a_raddr,
+            16,
+        ),
+    ) {
+        return;
+    }
+    if !bench_setup_try(
+        stat,
+        "CPT_CRT switch target B",
+        rme_cpt_crt(
+            RME_BOOT_INIT_CPT,
+            RME_BOOT_INIT_KOM,
+            CAP_TEST_CPT2,
+            cpt_b_raddr,
+            16,
+        ),
+    ) {
+        return;
+    }
+    if !bench_setup_try(
+        stat,
+        "PGT_CRT process root",
+        bench_pgt_crt(CAP_TEST_PGT, pgt_raddr, 0, 1, RME_PGT_SIZE_1G),
+    ) {
+        return;
+    }
+    if !bench_setup_try(
+        stat,
+        "PRC_CRT switch process",
+        rme_prc_crt(RME_BOOT_INIT_CPT, CAP_TEST_PRC, CAP_TEST_CPT, CAP_TEST_PGT),
+    ) {
+        return;
+    }
     stat.reset();
 
     let mut count: u64 = 0;
@@ -2714,11 +2863,16 @@ fn bench_test_prc_cpt(stat: &mut BenchStat) {
 
         stat.record((end - start) as u32);
 
-        let _ = rme_prc_cpt(CAP_TEST_PRC, CAP_TEST_CPT);
+        if !bench_setup_try(
+            stat,
+            "PRC_CPT restore captbl",
+            rme_prc_cpt(CAP_TEST_PRC, CAP_TEST_CPT),
+        ) {
+            break;
+        }
         count += 1;
     }
 
-    bench_wait_quiesce();
     let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_PRC);
     let _ = rme_prc_del(RME_BOOT_INIT_CPT, CAP_TEST_PRC);
     let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_CPT);
@@ -2741,16 +2895,40 @@ fn bench_test_prc_pgt(stat: &mut BenchStat) {
     let cpt_raddr = bench_kom_alloc(16 * 64, 64);
     let pgt_a_raddr = bench_kom_alloc(0x1000, 0x1000);
     let pgt_b_raddr = bench_kom_alloc(0x1000, 0x1000);
-    let _ = rme_cpt_crt(
-        RME_BOOT_INIT_CPT,
-        RME_BOOT_INIT_KOM,
-        CAP_TEST_CPT,
-        cpt_raddr,
-        16,
-    );
-    let _ = bench_pgt_crt(CAP_TEST_PGT, pgt_a_raddr, 0, 1, RME_PGT_SIZE_1G);
-    let _ = bench_pgt_crt(CAP_TEST_PGT2, pgt_b_raddr, 0, 1, RME_PGT_SIZE_1G);
-    let _ = rme_prc_crt(RME_BOOT_INIT_CPT, CAP_TEST_PRC, CAP_TEST_CPT, CAP_TEST_PGT);
+    if !bench_setup_try(
+        stat,
+        "CPT_CRT switch process captbl",
+        rme_cpt_crt(
+            RME_BOOT_INIT_CPT,
+            RME_BOOT_INIT_KOM,
+            CAP_TEST_CPT,
+            cpt_raddr,
+            16,
+        ),
+    ) {
+        return;
+    }
+    if !bench_setup_try(
+        stat,
+        "PGT_CRT switch root A",
+        bench_pgt_crt(CAP_TEST_PGT, pgt_a_raddr, 0, 1, RME_PGT_SIZE_1G),
+    ) {
+        return;
+    }
+    if !bench_setup_try(
+        stat,
+        "PGT_CRT switch root B",
+        bench_pgt_crt(CAP_TEST_PGT2, pgt_b_raddr, 0, 1, RME_PGT_SIZE_1G),
+    ) {
+        return;
+    }
+    if !bench_setup_try(
+        stat,
+        "PRC_CRT switch process",
+        rme_prc_crt(RME_BOOT_INIT_CPT, CAP_TEST_PRC, CAP_TEST_CPT, CAP_TEST_PGT),
+    ) {
+        return;
+    }
     stat.reset();
 
     let mut count: u64 = 0;
@@ -2761,11 +2939,16 @@ fn bench_test_prc_pgt(stat: &mut BenchStat) {
 
         stat.record((end - start) as u32);
 
-        let _ = rme_prc_pgt(CAP_TEST_PRC, CAP_TEST_PGT);
+        if !bench_setup_try(
+            stat,
+            "PRC_PGT restore root",
+            rme_prc_pgt(CAP_TEST_PRC, CAP_TEST_PGT),
+        ) {
+            break;
+        }
         count += 1;
     }
 
-    bench_wait_quiesce();
     let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_PRC);
     let _ = rme_prc_del(RME_BOOT_INIT_CPT, CAP_TEST_PRC);
     let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_CPT);
@@ -2799,7 +2982,6 @@ fn bench_test_thd_crt(stat: &mut BenchStat) {
 
         stat.record((end - start) as u32);
 
-        bench_wait_quiesce();
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_THD);
         let _ = rme_thd_del(RME_BOOT_INIT_CPT, CAP_TEST_THD);
         count += 1;
@@ -2820,8 +3002,13 @@ fn bench_test_thd_del(stat: &mut BenchStat) {
     let mut count: u64 = 0;
     while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
         let raddr = bench_kom_alloc(0x2000, 0x1000);
-        let _ = bench_thd_crt(RME_BOOT_INIT_CPT, CAP_TEST_THD, RME_BOOT_INIT_PRC, raddr);
-        bench_wait_quiesce();
+        if !bench_setup_try(
+            stat,
+            "THD_CRT delete target",
+            bench_thd_crt(RME_BOOT_INIT_CPT, CAP_TEST_THD, RME_BOOT_INIT_PRC, raddr),
+        ) {
+            break;
+        }
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_THD);
 
         let start = bench_read_cycle();
@@ -2847,7 +3034,13 @@ fn bench_test_thd_bind(stat: &mut BenchStat) {
     let mut count: u64 = 0;
     while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
         let raddr = bench_kom_alloc(0x2000, 0x1000);
-        let _ = bench_thd_crt(RME_BOOT_INIT_CPT, CAP_TEST_THD, RME_BOOT_INIT_PRC, raddr);
+        if !bench_setup_try(
+            stat,
+            "THD_CRT bind target",
+            bench_thd_crt(RME_BOOT_INIT_CPT, CAP_TEST_THD, RME_BOOT_INIT_PRC, raddr),
+        ) {
+            break;
+        }
         let cap_thd = rme_cid_2l(RME_BOOT_INIT_CPT, CAP_TEST_THD);
 
         let start = bench_read_cycle();
@@ -2857,7 +3050,6 @@ fn bench_test_thd_bind(stat: &mut BenchStat) {
         stat.record((end - start) as u32);
 
         let _ = rme_thd_sched_free(cap_thd);
-        bench_wait_quiesce();
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_THD);
         let _ = rme_thd_del(RME_BOOT_INIT_CPT, CAP_TEST_THD);
         count += 1;
@@ -2878,9 +3070,21 @@ fn bench_test_thd_free(stat: &mut BenchStat) {
     let mut count: u64 = 0;
     while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
         let raddr = bench_kom_alloc(0x2000, 0x1000);
-        let _ = bench_thd_crt(RME_BOOT_INIT_CPT, CAP_TEST_THD, RME_BOOT_INIT_PRC, raddr);
+        if !bench_setup_try(
+            stat,
+            "THD_CRT free target",
+            bench_thd_crt(RME_BOOT_INIT_CPT, CAP_TEST_THD, RME_BOOT_INIT_PRC, raddr),
+        ) {
+            break;
+        }
         let cap_thd = rme_cid_2l(RME_BOOT_INIT_CPT, CAP_TEST_THD);
-        let _ = bench_thd_bind(cap_thd, 0);
+        if !bench_setup_try(
+            stat,
+            "THD_SCHED_BIND free target",
+            bench_thd_bind(cap_thd, 0),
+        ) {
+            break;
+        }
 
         let start = bench_read_cycle();
         let _ = stat.set_ret(rme_thd_sched_free(cap_thd) as i64);
@@ -2888,7 +3092,6 @@ fn bench_test_thd_free(stat: &mut BenchStat) {
 
         stat.record((end - start) as u32);
 
-        bench_wait_quiesce();
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_THD);
         let _ = rme_thd_del(RME_BOOT_INIT_CPT, CAP_TEST_THD);
         count += 1;
@@ -2912,9 +3115,21 @@ fn bench_test_thd_exec_set(stat: &mut BenchStat) {
     let mut count: u64 = 0;
     while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
         let raddr = bench_kom_alloc(0x2000, 0x1000);
-        let _ = bench_thd_crt(RME_BOOT_INIT_CPT, CAP_TEST_THD, RME_BOOT_INIT_PRC, raddr);
+        if !bench_setup_try(
+            stat,
+            "THD_CRT exec_set target",
+            bench_thd_crt(RME_BOOT_INIT_CPT, CAP_TEST_THD, RME_BOOT_INIT_PRC, raddr),
+        ) {
+            break;
+        }
         let cap_thd = rme_cid_2l(RME_BOOT_INIT_CPT, CAP_TEST_THD);
-        let _ = bench_thd_bind(cap_thd, 0);
+        if !bench_setup_try(
+            stat,
+            "THD_SCHED_BIND exec_set target",
+            bench_thd_bind(cap_thd, 0),
+        ) {
+            break;
+        }
 
         let start = bench_read_cycle();
         let _ = stat.set_ret(rme_thd_exec_set(cap_thd, entry, stack, 0) as i64);
@@ -2923,7 +3138,6 @@ fn bench_test_thd_exec_set(stat: &mut BenchStat) {
         stat.record((end - start) as u32);
 
         let _ = rme_thd_sched_free(cap_thd);
-        bench_wait_quiesce();
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_THD);
         let _ = rme_thd_del(RME_BOOT_INIT_CPT, CAP_TEST_THD);
         count += 1;
@@ -2944,9 +3158,21 @@ fn bench_test_thd_prio(stat: &mut BenchStat) {
     let mut count: u64 = 0;
     while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
         let raddr = bench_kom_alloc(0x2000, 0x1000);
-        let _ = bench_thd_crt(RME_BOOT_INIT_CPT, CAP_TEST_THD, RME_BOOT_INIT_PRC, raddr);
+        if !bench_setup_try(
+            stat,
+            "THD_CRT prio target",
+            bench_thd_crt(RME_BOOT_INIT_CPT, CAP_TEST_THD, RME_BOOT_INIT_PRC, raddr),
+        ) {
+            break;
+        }
         let cap_thd = rme_cid_2l(RME_BOOT_INIT_CPT, CAP_TEST_THD);
-        let _ = bench_thd_bind(cap_thd, 0);
+        if !bench_setup_try(
+            stat,
+            "THD_SCHED_BIND prio target",
+            bench_thd_bind(cap_thd, 0),
+        ) {
+            break;
+        }
 
         let start = bench_read_cycle();
         let _ = stat.set_ret(rme_thd_sched_prio(cap_thd, 1) as i64);
@@ -2956,7 +3182,6 @@ fn bench_test_thd_prio(stat: &mut BenchStat) {
 
         let _ = rme_thd_sched_prio(cap_thd, 0);
         let _ = rme_thd_sched_free(cap_thd);
-        bench_wait_quiesce();
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_THD);
         let _ = rme_thd_del(RME_BOOT_INIT_CPT, CAP_TEST_THD);
         count += 1;
@@ -2977,9 +3202,21 @@ fn bench_test_thd_time_xfer(stat: &mut BenchStat) {
     let mut count: u64 = 0;
     while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
         let raddr = bench_kom_alloc(0x2000, 0x1000);
-        let _ = bench_thd_crt(RME_BOOT_INIT_CPT, CAP_TEST_THD, RME_BOOT_INIT_PRC, raddr);
+        if !bench_setup_try(
+            stat,
+            "THD_CRT time_xfer target",
+            bench_thd_crt(RME_BOOT_INIT_CPT, CAP_TEST_THD, RME_BOOT_INIT_PRC, raddr),
+        ) {
+            break;
+        }
         let cap_thd = rme_cid_2l(RME_BOOT_INIT_CPT, CAP_TEST_THD);
-        let _ = bench_thd_bind(cap_thd, 0);
+        if !bench_setup_try(
+            stat,
+            "THD_SCHED_BIND time_xfer target",
+            bench_thd_bind(cap_thd, 0),
+        ) {
+            break;
+        }
 
         let start = bench_read_cycle();
         let _ = stat.set_ret(rme_thd_time_xfer(cap_thd, RME_BOOT_INIT_THD, 1) as i64);
@@ -2988,7 +3225,6 @@ fn bench_test_thd_time_xfer(stat: &mut BenchStat) {
         stat.record((end - start) as u32);
 
         let _ = rme_thd_sched_free(cap_thd);
-        bench_wait_quiesce();
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_THD);
         let _ = rme_thd_del(RME_BOOT_INIT_CPT, CAP_TEST_THD);
         count += 1;
@@ -3006,16 +3242,28 @@ Return      : None.
 *****************************************************************************/
 fn bench_test_thd_sched_rcv(stat: &mut BenchStat) {
     let raddr = bench_kom_alloc(0x2000, 0x1000);
-    bench_setup_check(
+    if !bench_setup_try(
+        stat,
         "THD_CRT sched_rcv dummy",
         bench_thd_crt(RME_BOOT_INIT_CPT, CAP_TEST_THD, RME_BOOT_INIT_PRC, raddr),
-    );
+    ) {
+        return;
+    }
     let cap_thd = rme_cid_2l(RME_BOOT_INIT_CPT, CAP_TEST_THD);
-    bench_setup_check("THD_SCHED_BIND sched_rcv dummy", bench_thd_bind(cap_thd, 0));
-    bench_setup_check(
+    if !bench_setup_try(
+        stat,
+        "THD_SCHED_BIND sched_rcv dummy",
+        bench_thd_bind(cap_thd, 0),
+    ) {
+        return;
+    }
+    if !bench_setup_try(
+        stat,
         "THD_TIME_XFER sched_rcv arm",
         rme_thd_time_xfer(cap_thd, RME_BOOT_INIT_THD, 1),
-    );
+    ) {
+        return;
+    }
 
     stat.reset();
 
@@ -3049,7 +3297,6 @@ fn bench_test_thd_sched_rcv(stat: &mut BenchStat) {
     }
 
     let _ = rme_thd_sched_free(cap_thd);
-    bench_wait_quiesce();
     let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_THD);
     let _ = rme_thd_del(RME_BOOT_INIT_CPT, CAP_TEST_THD);
 }
@@ -3072,7 +3319,6 @@ fn bench_test_sig_crt(stat: &mut BenchStat) {
 
         stat.record((end - start) as u32);
 
-        bench_wait_quiesce();
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_SIG);
         let _ = rme_sig_del(RME_BOOT_INIT_CPT, CAP_TEST_SIG);
         count += 1;
@@ -3092,8 +3338,9 @@ fn bench_test_sig_del(stat: &mut BenchStat) {
 
     let mut count: u64 = 0;
     while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let _ = bench_sig_crt(CAP_TEST_SIG);
-        bench_wait_quiesce();
+        if !bench_setup_try(stat, "SIG_CRT delete target", bench_sig_crt(CAP_TEST_SIG)) {
+            break;
+        }
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_SIG);
 
         let start = bench_read_cycle();
@@ -3131,7 +3378,6 @@ fn bench_test_inv_crt(stat: &mut BenchStat) {
 
         stat.record((end - start) as u32);
 
-        bench_wait_quiesce();
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_INV);
         let _ = rme_inv_del(RME_BOOT_INIT_CPT, CAP_TEST_INV);
         count += 1;
@@ -3159,7 +3405,6 @@ fn bench_test_inv_del(stat: &mut BenchStat) {
             CAP_BENCH_PRC,
             raddr,
         );
-        bench_wait_quiesce();
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_INV);
 
         let start = bench_read_cycle();
@@ -3203,7 +3448,6 @@ fn bench_test_inv_set(stat: &mut BenchStat) {
 
         stat.record((end - start) as u32);
 
-        bench_wait_quiesce();
         let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_INV);
         let _ = rme_inv_del(RME_BOOT_INIT_CPT, CAP_TEST_INV);
         count += 1;
@@ -3456,7 +3700,13 @@ fn bench_test_kfn_debug_inv_mod(stat: &mut BenchStat) {
         core::ptr::addr_of!(BENCH_STACK_INV[BENCH_STACK_WORD_NUM - 1]) as u64
     });
     let entry = bench_inv_dbg_entry as extern "C" fn(u64) -> ! as u64;
-    let _ = rme_inv_set(cap_inv, entry, stack, 0);
+    if !bench_setup_try(
+        stat,
+        "INV_SET debug stub",
+        rme_inv_set(cap_inv, entry, stack, 0),
+    ) {
+        return;
+    }
     stat.reset();
 
     let mut count: u64 = 0;
