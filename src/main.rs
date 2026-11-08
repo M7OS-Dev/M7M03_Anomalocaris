@@ -27,7 +27,7 @@ mod syscall;
 
 use core::panic::PanicInfo;
 
-use benchmark::{rme_benchmark, rme_print_char};
+use benchmark::{bench_main, bench_print_char};
 /* End Include ***************************************************************/
 
 /* Entry:_start ***************************************************************
@@ -95,17 +95,17 @@ Return      : ! - This function never returns.
 #[unsafe(no_mangle)]
 pub extern "C" fn main(cpuid: u64) -> ! {
     if cpuid == 0 {
-        rme_benchmark()
+        bench_main()
     }
 
     /* Secondary harts: print a-z once, then idle */
     let mut ch: u8 = b'a';
     while ch <= b'z' {
-        rme_print_char(ch);
+        bench_print_char(ch);
         ch += 1;
     }
-    rme_print_char(b'\r');
-    rme_print_char(b'\n');
+    bench_print_char(b'\r');
+    bench_print_char(b'\n');
 
     loop {}
 }

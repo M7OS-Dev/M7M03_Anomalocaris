@@ -7,12 +7,12 @@ Description : User-mode system call interface for the RV64V port on QEMU
               virt, mirroring the C rme_syscall.h. Mirrors the kernel's
               syscall ABI and constants (Include/rme.h) without depending on
               kernel headers, so any user program can include it standalone.
-              Syscall ABI on RV64V:
-                a0 = (Svc_Num << 16) | Cid
+              Syscall ABI on RV64V (64-bit split):
+                a0 = (Svc << 32) | Cid
                 a1 = Param0, a2 = Param1, a3 = Param2
                 ecall                 (cause 8, delegated to S-mode by OpenSBI)
-                return value comes back in a0
-              rme_syscall() is the ONLY ecall in a user program - everything
+                return value comes back in a0; some calls also use a1
+              rme_syscall_raw() is the ONLY ecall in a user program - everything
               else is built on top of it.
 ******************************************************************************/
 
@@ -119,6 +119,41 @@ pub const RME_KFN_DEBUG_EXC_GET: RmePtr = 0xF803;
 pub const RME_KFN_DEBUG_MODE_MOD: RmePtr = 0xF804;
 pub const RME_KFN_DEBUG_IBP_MOD: RmePtr = 0xF805;
 pub const RME_KFN_DEBUG_DBP_MOD: RmePtr = 0xF806;
+
+/* RV64V cache maintenance KFN sub-IDs (mirror of rme_platform_rv64v.h) ******/
+pub const RME_RV64V_KFN_CACHE_ICACHE: RmePtr = 0;
+pub const RME_RV64V_KFN_CACHE_DCACHE: RmePtr = 1;
+pub const RME_RV64V_KFN_CACHE_CLEAN_ALL: RmePtr = 0;
+pub const RME_RV64V_KFN_CACHE_CLEAN_ADDR: RmePtr = 1;
+pub const RME_RV64V_KFN_CACHE_INV_ALL: RmePtr = 5;
+pub const RME_RV64V_KFN_CACHE_INV_ADDR: RmePtr = 6;
+pub const RME_RV64V_KFN_CACHE_CLEAN_INV_ALL: RmePtr = 10;
+pub const RME_RV64V_KFN_CACHE_CLEAN_INV_ADDR: RmePtr = 11;
+pub const RME_RV64V_CACHE_BLOCK_SIZE: RmePtr = 64;
+
+/* RV64V page-table entry query KFN sub-IDs **********************************/
+pub const RME_RV64V_KFN_PGT_ENTRY_MOD_FLAG_GET: RmePtr = 0;
+pub const RME_RV64V_KFN_PGT_ENTRY_MOD_SZORD_GET: RmePtr = 1;
+pub const RME_RV64V_KFN_PGT_ENTRY_MOD_NMORD_GET: RmePtr = 2;
+
+/* RV64V debug KFN sub-IDs ***************************************************/
+pub const RME_RV64V_KFN_DEBUG_REG_MOD_GET: RmePtr = 0;
+pub const RME_RV64V_KFN_DEBUG_REG_MOD_SET: RmePtr = 1 << 16;
+pub const RME_RV64V_KFN_DEBUG_REG_MOD_X10_A0: RmePtr = 11;
+
+pub const RME_RV64V_KFN_DEBUG_INV_MOD_SP_GET: RmePtr = 0;
+pub const RME_RV64V_KFN_DEBUG_INV_MOD_SP_SET: RmePtr = 1;
+pub const RME_RV64V_KFN_DEBUG_INV_MOD_PC_GET: RmePtr = 2;
+pub const RME_RV64V_KFN_DEBUG_INV_MOD_PC_SET: RmePtr = 3;
+
+pub const RME_RV64V_KFN_DEBUG_EXC_CAUSE_GET: RmePtr = 0;
+pub const RME_RV64V_KFN_DEBUG_EXC_ADDR_GET: RmePtr = 1;
+pub const RME_RV64V_KFN_DEBUG_EXC_VALUE_GET: RmePtr = 2;
+
+/* KFN capability range: high limit in [63:32], low limit in [31:0]. The boot
+ * KFN capability allows every function ID, so delegating it uses the same
+ * full range. */
+pub const RME_KFN_FLAG_FULL_RANGE: RmePtr = 0xFFFF_FFFF_0000_0000;
 
 /* Signal endpoint flags (mirror of Include/rme.h) *****************************/
 pub const RME_SIG_FLAG_SND: RmePtr = 1 << 0;
@@ -307,10 +342,74 @@ pub const fn rme_param_o0(x: RmePtr) -> RmePtr {
 }
 /* End Parameter packing *****************************************************/
 
+/* Type:RmeRet ***************************************************************
+Description : The three registers the kernel can write as return values.
+              a0 is the primary status/value, a1 carries the INV_ACT callee
+              return, and a2 carries DEBUG_EXC_GET's query value.
+*****************************************************************************/
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RmeRet {
+    pub a0: RmePtr,
+    pub a1: RmePtr,
+    pub a2: RmePtr,
+}
+/* End Type:RmeRet ***********************************************************/
+
+impl RmeRet {
+    #[inline(always)]
+    pub fn status(&self) -> i64 {
+        self.a0 as i64
+    }
+
+    #[inline(always)]
+    pub fn ok(&self) -> bool {
+        self.status() >= 0
+    }
+}
+
+/* Function:rme_syscall_raw ***************************************************
+Description : The only ecall. It returns a0/a1/a2 together because most SVCs
+              only use a0, INV_ACT uses a1, and DEBUG_EXC_GET uses a2.
+              The Svc word is (svc_num << 32) | (cid & 0xFFFFFFFF).
+Input       : svc_num - The system call number (including Attr/PC bits).
+              cid - The capability ID (32 bits).
+              param0 - The first system call parameter (a1).
+              param1 - The second system call parameter (a2).
+              param2 - The third system call parameter (a3).
+Output      : None.
+Return      : RmeRet - (a0, a1, a2).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_syscall_raw(
+    svc_num: RmePtr,
+    cid: RmePtr,
+    param0: RmePtr,
+    param1: RmePtr,
+    param2: RmePtr,
+) -> RmeRet {
+    let mut a0: RmePtr = (svc_num << 32) | (cid & 0xFFFF_FFFF);
+    let mut a1: RmePtr = param0;
+    let mut a2: RmePtr = param1;
+
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") a0 => a0,
+            inlateout("a1") a1 => a1,
+            inlateout("a2") a2 => a2,
+            in("a3") param2,
+            options(nostack),
+        );
+    }
+
+    RmeRet { a0, a1, a2 }
+}
+/* End Function:rme_syscall_raw **********************************************/
+
 /* Function:rme_syscall *******************************************************
-Description : The generic system call - the only ecall in the user program.
-              Everything else is built on top of this primitive.
-Input       : svc_num - The system call number.
+Description : Scalar wrapper for the SVCs that only need the a0 return value.
+Input       : svc_num - The system call number (including Attr/PC bits).
               cid - The capability ID (in the caller's capability table).
               param0 - The first system call parameter.
               param1 - The second system call parameter.
@@ -326,21 +425,7 @@ pub fn rme_syscall(
     param1: RmePtr,
     param2: RmePtr,
 ) -> RmePtr {
-    let a0: RmePtr = (svc_num << 16) | cid;
-    let ret: RmePtr;
-
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            inlateout("a0") a0 => ret,
-            in("a1") param0,
-            in("a2") param1,
-            in("a3") param2,
-            options(nostack),
-        );
-    }
-
-    ret
+    rme_syscall_raw(svc_num, cid, param0, param1, param2).a0
 }
 /* End Function:rme_syscall **************************************************/
 
@@ -575,18 +660,87 @@ pub fn rme_inv_set(cap_inv: RmePtr, entry: RmePtr, stack: RmePtr, is_exc_ret: Rm
 }
 /* End Function:rme_inv_set ***************************************************/
 
+/* The invocation entry/return path only restores PC and SP. The invocation
+ * stub may clobber ra and s0-s11 because it exits through INV_RET instead of
+ * running its function epilogue. The compiler cannot express s0/s1 as inline
+ * asm clobbers (s0 is the frame pointer and s1 is reserved by LLVM), so this
+ * tiny gate saves/restores ra and s0-s11 around the ecall. Caller-saved
+ * registers are covered by the normal extern "C" call boundary.
+ *
+ * The gate returns two registers (a0/a1); the Rust wrapper assembles RmeRet
+ * with a2 = 0. RmeRet itself is 24 bytes, so it is not returned directly
+ * through the C ABI. */
+#[repr(C)]
+struct RmeRet2 {
+    a0: RmePtr,
+    a1: RmePtr,
+}
+
+core::arch::global_asm!(
+    r#"
+    .section .text.rme_inv_act_asm, "ax", @progbits
+    .align 2
+    .global rme_inv_act_asm
+rme_inv_act_asm:
+    addi sp, sp, -112
+    sd ra, 0(sp)
+    sd s0, 8(sp)
+    sd s1, 16(sp)
+    sd s2, 24(sp)
+    sd s3, 32(sp)
+    sd s4, 40(sp)
+    sd s5, 48(sp)
+    sd s6, 56(sp)
+    sd s7, 64(sp)
+    sd s8, 72(sp)
+    sd s9, 80(sp)
+    sd s10, 88(sp)
+    sd s11, 96(sp)
+    mv a2, a1
+    mv a1, a0
+    li a0, 1
+    slli a0, a0, 32
+    li a3, 0
+    ecall
+    ld ra, 0(sp)
+    ld s0, 8(sp)
+    ld s1, 16(sp)
+    ld s2, 24(sp)
+    ld s3, 32(sp)
+    ld s4, 40(sp)
+    ld s5, 48(sp)
+    ld s6, 56(sp)
+    ld s7, 64(sp)
+    ld s8, 72(sp)
+    ld s9, 80(sp)
+    ld s10, 88(sp)
+    ld s11, 96(sp)
+    addi sp, sp, 112
+    ret
+"#
+);
+
+unsafe extern "C" {
+    fn rme_inv_act_asm(cap_inv: RmePtr, param: RmePtr) -> RmeRet2;
+}
+
 /* Function:rme_inv_act *******************************************************
-Description : Activate an invocation stub. The kernel switches the caller to
-              the stub's entry point, running in the target process' address
-              space. The callee returns with rme_inv_ret().
+Description : Activate an invocation stub. a0 is the syscall status (0 or a
+              non-negative success value, negative on failure), a1 is the
+              callee's INV_RET value, and a2 is unused (zero).
 Input       : cap_inv - The capability to the invocation stub (two-level).
-              param - The argument passed to the callee in a0.
+              param - The argument passed to the callee.
 Output      : None.
-Return      : RmePtr - The kernel return value (0 on success).
+Return      : RmeRet - (a0, a1, 0).
 *****************************************************************************/
 #[inline(always)]
-pub fn rme_inv_act(cap_inv: RmePtr, param: RmePtr) -> RmePtr {
-    rme_syscall(RME_SVC_INV_ACT, 0, cap_inv, param, 0)
+pub fn rme_inv_act(cap_inv: RmePtr, param: RmePtr) -> RmeRet {
+    let ret = unsafe { rme_inv_act_asm(cap_inv, param) };
+    RmeRet {
+        a0: ret.a0,
+        a1: ret.a1,
+        a2: 0,
+    }
 }
 /* End Function:rme_inv_act ***************************************************/
 
@@ -677,6 +831,330 @@ pub fn rme_prc_crt(
     rme_syscall(RME_SVC_PRC_CRT, cap_cpt, cap_prc, cap_cpt_new, cap_pgt)
 }
 /* End Function:rme_prc_crt ***************************************************/
+
+/* Function:rme_thd_sched_free ***********************************************
+Description : Free a thread from its current processor binding.
+Input       : cap_thd - The capability to the target thread.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_thd_sched_free(cap_thd: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_THD_SCHED_FREE, 0, cap_thd, 0, 0)
+}
+/* End Function:rme_thd_sched_free *******************************************/
+
+/* Function:rme_thd_sched_prio ***********************************************
+Description : Change one thread's priority. This is the one-thread form of
+              THD_SCHED_PRIO (Number = 1).
+Input       : cap_thd - The capability to the target thread.
+              prio - The new preemptive priority.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_thd_sched_prio(cap_thd: RmePtr, prio: RmePtr) -> RmePtr {
+    rme_syscall(
+        RME_SVC_THD_SCHED_PRIO,
+        1,
+        rme_param_d0(cap_thd),
+        0,
+        rme_param_q0(prio),
+    )
+}
+/* End Function:rme_thd_sched_prio *******************************************/
+
+/* Function:rme_cpt_del ******************************************************
+Description : Delete an empty capability table. The target capability must be
+              frozen first.
+Input       : cap_cpt - The capability table that contains the target cap.
+              cap_del - The target capability slot.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_cpt_del(cap_cpt: RmePtr, cap_del: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_CPT_DEL, cap_cpt, cap_del, 0, 0)
+}
+/* End Function:rme_cpt_del **************************************************/
+
+/* Function:rme_cpt_frz ******************************************************
+Description : Freeze a capability. Freeze is irreversible; deletion/removal
+              paths require this state first.
+Input       : cap_cpt - The capability table that contains the target cap.
+              cap_frz - The target capability slot.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_cpt_frz(cap_cpt: RmePtr, cap_frz: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_CPT_FRZ, cap_cpt, cap_frz, 0, 0)
+}
+/* End Function:rme_cpt_frz **************************************************/
+
+/* Function:rme_cpt_rem ******************************************************
+Description : Remove a delegated (leaf) capability from a table. The target
+              capability must be frozen first.
+Input       : cap_cpt - The capability table that contains the target cap.
+              cap_rem - The target capability slot.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_cpt_rem(cap_cpt: RmePtr, cap_rem: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_CPT_REM, cap_cpt, cap_rem, 0, 0)
+}
+/* End Function:rme_cpt_rem **************************************************/
+
+/* Function:rme_pgt_crt ******************************************************
+Description : Create a page table. Num_Order is an exponent (512 entries = 9),
+              and is carried in the high bits of the service number.
+Input       : cap_cpt - The capability table to create the cap in.
+              cap_kom - The kernel memory capability.
+              cap_pgt - The capability slot for the new table.
+              raddr - The relative KOM address (4KB aligned).
+              base - The virtual base the table covers.
+              is_top - Non-zero for the top-level table (1G entries only).
+              size_order - The page size order (4K/2M/1G).
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_pgt_crt(
+    cap_cpt: RmePtr,
+    cap_kom: RmePtr,
+    cap_pgt: RmePtr,
+    raddr: RmePtr,
+    base: RmePtr,
+    is_top: RmePtr,
+    size_order: RmePtr,
+) -> RmePtr {
+    let svc_num: RmePtr = RME_SVC_PGT_CRT | (RME_PGT_NUM_512 << 16);
+    let param0: RmePtr = rme_param_d1(cap_kom) | rme_param_q1(cap_pgt) | rme_param_q0(size_order);
+    rme_syscall(svc_num, cap_cpt, param0, raddr, base | is_top)
+}
+/* End Function:rme_pgt_crt **************************************************/
+
+/* Function:rme_pgt_del ******************************************************
+Description : Delete a page table. The target capability must be frozen first.
+Input       : cap_cpt - The capability table that contains the target cap.
+              cap_pgt - The target capability slot.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_pgt_del(cap_cpt: RmePtr, cap_pgt: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_PGT_DEL, cap_cpt, cap_pgt, 0, 0)
+}
+/* End Function:rme_pgt_del **************************************************/
+
+/* Function:rme_pgt_add ******************************************************
+Description : Map a page from a source table into a destination table.
+Input       : cap_dst - The destination page table capability.
+              pos_dst - The destination position.
+              cap_src - The source page table capability.
+              pos_src - The source position.
+              flag_dst - The destination page permissions (must be a subset of
+                         the source page's flags; use ALL_DYN for init pages).
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_pgt_add(
+    cap_dst: RmePtr,
+    pos_dst: RmePtr,
+    cap_src: RmePtr,
+    pos_src: RmePtr,
+    flag_dst: RmePtr,
+) -> RmePtr {
+    rme_syscall(
+        RME_SVC_PGT_ADD,
+        flag_dst,
+        rme_param_d1(cap_dst) | rme_param_d0(pos_dst),
+        rme_param_d1(cap_src) | rme_param_d0(pos_src),
+        0,
+    )
+}
+/* End Function:rme_pgt_add **************************************************/
+
+/* Function:rme_pgt_rem ******************************************************
+Description : Unmap a page from a page table.
+Input       : cap_pgt - The page table capability.
+              pos - The position to unmap.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_pgt_rem(cap_pgt: RmePtr, pos: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_PGT_REM, 0, cap_pgt, pos, 0)
+}
+/* End Function:rme_pgt_rem **************************************************/
+
+/* Function:rme_pgt_con ******************************************************
+Description : Map a child page table into a parent page table.
+Input       : cap_parent - The parent page table capability.
+              pos - The parent position.
+              cap_child - The child page table capability.
+              flag_child - The child mapping flags.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_pgt_con(
+    cap_parent: RmePtr,
+    pos: RmePtr,
+    cap_child: RmePtr,
+    flag_child: RmePtr,
+) -> RmePtr {
+    rme_syscall(
+        RME_SVC_PGT_CON,
+        0,
+        rme_param_d1(cap_parent) | rme_param_d0(cap_child),
+        pos,
+        flag_child,
+    )
+}
+/* End Function:rme_pgt_con **************************************************/
+
+/* Function:rme_pgt_des ******************************************************
+Description : Unmap a child page table from a parent page table.
+Input       : cap_parent - The parent page table capability.
+              pos - The parent position.
+              cap_child - The child page table capability.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_pgt_des(cap_parent: RmePtr, pos: RmePtr, cap_child: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_PGT_DES, 0, cap_parent, pos, cap_child)
+}
+/* End Function:rme_pgt_des **************************************************/
+
+/* Function:rme_prc_del ******************************************************
+Description : Delete a process. The target capability must be frozen first.
+Input       : cap_cpt - The capability table that contains the target cap.
+              cap_prc - The target process capability slot.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_prc_del(cap_cpt: RmePtr, cap_prc: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_PRC_DEL, cap_cpt, cap_prc, 0, 0)
+}
+/* End Function:rme_prc_del **************************************************/
+
+/* Function:rme_prc_cpt ******************************************************
+Description : Change a process's capability table.
+Input       : cap_prc - The process capability.
+              cap_cpt - The new capability table capability.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_prc_cpt(cap_prc: RmePtr, cap_cpt: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_PRC_CPT, 0, cap_prc, cap_cpt, 0)
+}
+/* End Function:rme_prc_cpt **************************************************/
+
+/* Function:rme_prc_pgt ******************************************************
+Description : Change a process's page table.
+Input       : cap_prc - The process capability.
+              cap_pgt - The new root page table capability.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_prc_pgt(cap_prc: RmePtr, cap_pgt: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_PRC_PGT, 0, cap_prc, cap_pgt, 0)
+}
+/* End Function:rme_prc_pgt **************************************************/
+
+/* Function:rme_thd_del ******************************************************
+Description : Delete a thread. The target capability must be frozen and the
+              thread must be unbound.
+Input       : cap_cpt - The capability table that contains the target cap.
+              cap_thd - The target thread capability slot.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_thd_del(cap_cpt: RmePtr, cap_thd: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_THD_DEL, cap_cpt, cap_thd, 0, 0)
+}
+/* End Function:rme_thd_del **************************************************/
+
+/* Function:rme_sig_del ******************************************************
+Description : Delete a signal endpoint. The target capability must be frozen
+              and no thread may be blocked on it.
+Input       : cap_cpt - The capability table that contains the target cap.
+              cap_sig - The target signal capability slot.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_sig_del(cap_cpt: RmePtr, cap_sig: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_SIG_DEL, cap_cpt, cap_sig, 0, 0)
+}
+/* End Function:rme_sig_del **************************************************/
+
+/* Function:rme_inv_del ******************************************************
+Description : Delete an invocation stub. The target capability must be frozen
+              and the stub must not be active.
+Input       : cap_cpt - The capability table that contains the target cap.
+              cap_inv - The target invocation capability slot.
+Output      : None.
+Return      : RmePtr - The kernel return value (0 on success).
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_inv_del(cap_cpt: RmePtr, cap_inv: RmePtr) -> RmePtr {
+    rme_syscall(RME_SVC_INV_DEL, cap_cpt, cap_inv, 0, 0)
+}
+/* End Function:rme_inv_del **************************************************/
+
+/* Function:rme_kfn **********************************************************
+Description : Invoke a kernel function.
+Input       : cap_kfn - The kernel function capability.
+              func_id - The function ID.
+              sub_id - The subfunction ID.
+              param1 - The first function parameter.
+              param2 - The second function parameter.
+Output      : None.
+Return      : RmePtr - The kernel return value.
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_kfn(
+    cap_kfn: RmePtr,
+    func_id: RmePtr,
+    sub_id: RmePtr,
+    param1: RmePtr,
+    param2: RmePtr,
+) -> RmePtr {
+    rme_kfn_raw(cap_kfn, func_id, sub_id, param1, param2).a0
+}
+/* End Function:rme_kfn ******************************************************/
+
+/* Function:rme_kfn_raw *******************************************************
+Description : KFN with the full a0/a1/a2 return set. DEBUG_REG_MOD and
+              DEBUG_INV_MOD return their value in a1; DEBUG_EXC_GET returns it
+              in a2.
+*****************************************************************************/
+#[inline(always)]
+pub fn rme_kfn_raw(
+    cap_kfn: RmePtr,
+    func_id: RmePtr,
+    sub_id: RmePtr,
+    param1: RmePtr,
+    param2: RmePtr,
+) -> RmeRet {
+    rme_syscall_raw(
+        RME_SVC_KFN,
+        cap_kfn,
+        rme_param_d0(func_id) | rme_param_d1(sub_id),
+        param1,
+        param2,
+    )
+}
+/* End Function:rme_kfn_raw **************************************************/
 
 /* End Of File ***************************************************************/
 
