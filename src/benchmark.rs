@@ -65,8 +65,9 @@ Description : The benchmark framework and all benchmark tests for the RV64V
 /* Rounds for the normal tests; AVG/MAX/MIN are computed over these rounds. */
 const BENCH_LOOP_NUM: u64 = 10000;
 
-/* Reduced rounds for the heavy tests: tick preemption/IDLE_SLEEP (one tick per round)
- * and DEBUG_PRINT (console output). */
+/* Reduced rounds for the wall-clock/console-bound tests: tick preemption and
+ * IDLE_SLEEP (one 10ms tick per round), and DEBUG_PRINT (one console character
+ * per round). Every other test uses BENCH_LOOP_NUM. */
 const BENCH_LOOP_REDUCED_NUM: u64 = 100;
 
 /* The number of words reserved for each helper thread's stack. */
@@ -169,15 +170,10 @@ const CAP_TEST_PGT_PARENT: RmePtr = 38;
 const CAP_TEST_PGT_CHILD: RmePtr = 39;
 const CAP_TEST_PGT_DST: RmePtr = 40;
 const CAP_TEST_CPT3: RmePtr = 41;
-/* PGT_CON needs one fresh child table per position because PGT_DES is broken
- * in the current kernel (see the report note). 16 children fit in 42..57. */
+/* PGT_CON and PGT_DES are measured as a connect/disconnect pair on one
+ * parent/child pair, so a single child slot is enough. */
 const CAP_TEST_PGT_CON_PARENT: RmePtr = 58;
 const CAP_TEST_PGT_CHILD_BASE: RmePtr = 42;
-const BENCH_PGT_CON_ROUNDS: u64 = 16;
-
-/* Rounds for the object lifecycle tests. Creating/deleting kernel objects is
- * much heavier than a pure syscall, so fewer rounds are enough. */
-const BENCH_OBJ_LOOP_NUM: u64 = 1000;
 
 /* Upper bound on how long the measuring thread waits for a helper event before
  * declaring the test failed. This prevents a broken helper from hanging the
@@ -234,17 +230,6 @@ static mut BENCH_STOP: u32 = 0;
 static mut BENCH_START: u64 = 0;
 static mut BENCH_END: u64 = 0;
 
-/* The tickets of the thread switches. The measuring thread raises a ticket
- * before it switches to a switch target, and the target latches the arrival
- * timestamp once per raised ticket. A counter is used instead of a flag, so
- * that the target performs exactly one action per switch, and never one
- * action too many.
- * The two switch targets each have their own ticket: both of them spin while
- * they are idle, and a shared ticket would let one of them swallow the
- * other's switch. */
-static mut BENCH_TICKET_INTRA: u64 = 0;
-static mut BENCH_TICKET_INTER: u64 = 0;
-
 /* The statistics the receiving side accumulates. They live in the shared
  * image, so the measuring thread can pick them up once the test is over. */
 static mut BENCH_STAT_TOTAL: u64 = 0;
@@ -282,9 +267,10 @@ static mut CAP_SIG_PARK: RmePtr = 0;
 static mut CAP_SIG_PARK2: RmePtr = 0;
 static mut CAP_SIG_DATA: RmePtr = 0;
 
-/* The monotonic KOM allocator. Kernel objects must occupy distinct KOM
- * addresses; we never free them, the benchmark's total footprint is tiny
- * compared with the 496MB KOM. */
+/* The monotonic KOM allocator for long-lived fixtures. Objects that are
+ * created and deleted inside a test loop reuse one fixed address, because the
+ * kernel frees their KOT range on deletion; bump-allocating every round would
+ * exhaust the KOM when the loop count is large. */
 static mut BENCH_KOM_NEXT: RmePtr = BENCH_TEST_KOM_FRONTIER;
 /* End Private Variables *****************************************************/
 
@@ -509,60 +495,6 @@ fn bench_end_get() -> u64 {
     unsafe { core::ptr::read_volatile(&raw const BENCH_END) }
 }
 /* End Function:bench_end_get ***********************************************/
-
-/* Function:bench_ticket_intra_get *******************************************
-Description : Read the intra-process thread switch ticket.
-Input       : None.
-Output      : None.
-Return      : u64 - The current ticket.
-*****************************************************************************/
-#[inline(always)]
-fn bench_ticket_intra_get() -> u64 {
-    unsafe { core::ptr::read_volatile(&raw const BENCH_TICKET_INTRA) }
-}
-/* End Function:bench_ticket_intra_get **************************************/
-
-/* Function:bench_ticket_intra_raise ****************************************
-Description : Raise the intra-process thread switch ticket, so that the
-              switch target performs exactly one arrival latch for it.
-Input       : None.
-Output      : None.
-Return      : None.
-*****************************************************************************/
-#[inline(always)]
-fn bench_ticket_intra_raise() {
-    let ticket = bench_ticket_intra_get();
-
-    unsafe { core::ptr::write_volatile(&raw mut BENCH_TICKET_INTRA, ticket + 1) }
-}
-/* End Function:bench_ticket_intra_raise ************************************/
-
-/* Function:bench_ticket_inter_get *******************************************
-Description : Read the inter-process thread switch ticket.
-Input       : None.
-Output      : None.
-Return      : u64 - The current ticket.
-*****************************************************************************/
-#[inline(always)]
-fn bench_ticket_inter_get() -> u64 {
-    unsafe { core::ptr::read_volatile(&raw const BENCH_TICKET_INTER) }
-}
-/* End Function:bench_ticket_inter_get **************************************/
-
-/* Function:bench_ticket_inter_raise ****************************************
-Description : Raise the inter-process thread switch ticket, so that the
-              switch target performs exactly one arrival latch for it.
-Input       : None.
-Output      : None.
-Return      : None.
-*****************************************************************************/
-#[inline(always)]
-fn bench_ticket_inter_raise() {
-    let ticket = bench_ticket_inter_get();
-
-    unsafe { core::ptr::write_volatile(&raw mut BENCH_TICKET_INTER, ticket + 1) }
-}
-/* End Function:bench_ticket_inter_raise ************************************/
 
 /* Function:bench_stop_set **************************************************
 Description : Publish the shared stop flag.
@@ -1084,28 +1016,11 @@ Output      : None.
 Return      : ! - This function never returns.
 *****************************************************************************/
 extern "C" fn bench_p2t2_entry(_param: u64) -> ! {
-    /* The ticket of the previous inter-process switch this thread served. */
-    let mut served_ticket: u64 = 0;
-
     loop {
-        /* The measuring thread raises the ticket before it switches to us,
-         * so the ticket tells us that a switch is waiting for us. One
-         * ticket is served exactly once. */
-        let ticket = bench_ticket_inter_get();
-
-        if ticket != served_ticket {
-            served_ticket = ticket;
-
-            /* Latch the arrival of the switch, then hand the CPU back */
-            bench_end_set(bench_read_cycle());
-            let cap_p1t1 = unsafe { core::ptr::read_volatile(&raw const CAP_P1T1_IN_P2) };
-            let _ = rme_thd_swt(cap_p1t1, 0);
-        } else {
-            /* Nothing to do - wait for the measuring thread to switch to
-             * us. A thread switch needs the very same priority, so this
-             * thread stays on the init thread's priority level. */
-            core::hint::spin_loop();
-        }
+        /* Latch the arrival of the switch, then hand the CPU back */
+        bench_end_set(bench_read_cycle());
+        let cap_p1t1 = unsafe { core::ptr::read_volatile(&raw const CAP_P1T1_IN_P2) };
+        let _ = rme_thd_swt(cap_p1t1, 0);
     }
 }
 /* End Function:bench_p2t2_entry ********************************************/
@@ -1119,27 +1034,10 @@ Output      : None.
 Return      : ! - This function never returns.
 *****************************************************************************/
 extern "C" fn bench_p1t3_entry(_param: u64) -> ! {
-    /* The ticket of the previous intra-process switch this thread served. */
-    let mut served_ticket: u64 = 0;
-
     loop {
-        /* The measuring thread raises the ticket before it switches to us,
-         * so the ticket tells us that a switch is waiting for us. One
-         * ticket is served exactly once. */
-        let ticket = bench_ticket_intra_get();
-
-        if ticket != served_ticket {
-            served_ticket = ticket;
-
-            /* Latch the arrival of the switch, then hand the CPU back */
-            bench_end_set(bench_read_cycle());
-            let _ = rme_thd_swt(RME_BOOT_INIT_THD, 0);
-        } else {
-            /* Nothing to do - wait for the measuring thread to switch to
-             * us. A thread switch needs the very same priority, so this
-             * thread stays on the init thread's priority level. */
-            core::hint::spin_loop();
-        }
+        /* Latch the arrival of the switch, then hand the CPU back */
+        bench_end_set(bench_read_cycle());
+        let _ = rme_thd_swt(RME_BOOT_INIT_THD, 0);
     }
 }
 /* End Function:bench_p1t3_entry ********************************************/
@@ -2075,9 +1973,6 @@ fn bench_test_yield_intra(stat: &mut BenchStat) {
     stat.reset();
 
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
-        /* Raise the ticket, so that the target thread latches the arrival
-         * exactly once for this switch */
-        bench_ticket_intra_raise();
         bench_start_set(bench_read_cycle());
         let _ = stat.set_ret(rme_thd_swt(cap_p1t3, 0) as i64);
 
@@ -2099,7 +1994,6 @@ fn bench_test_yield_intra_roundtrip(stat: &mut BenchStat) {
     stat.reset();
 
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
-        bench_ticket_intra_raise();
         let start = bench_read_cycle();
         let ret = rme_thd_swt(cap_p1t3, 0) as i64;
         let end = bench_read_cycle();
@@ -2127,9 +2021,6 @@ fn bench_test_yield_inter(stat: &mut BenchStat) {
     stat.reset();
 
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
-        /* Raise the ticket, so that the target thread latches the arrival
-         * exactly once for this switch */
-        bench_ticket_inter_raise();
         bench_start_set(bench_read_cycle());
         let _ = stat.set_ret(rme_thd_swt(cap_p2t2, 0) as i64);
 
@@ -2151,7 +2042,6 @@ fn bench_test_yield_inter_roundtrip(stat: &mut BenchStat) {
     stat.reset();
 
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
-        bench_ticket_inter_raise();
         let start = bench_read_cycle();
         let ret = rme_thd_swt(cap_p2t2, 0) as i64;
         let end = bench_read_cycle();
@@ -2270,10 +2160,11 @@ Return      : None.
 fn bench_test_cpt_crt(stat: &mut BenchStat) {
     stat.reset();
 
+    /* The table is deleted at the end of every round, so the same KOM
+     * address can be reused instead of consuming a new range per round. */
+    let raddr = bench_kom_alloc(16 * 64, 64);
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let raddr = bench_kom_alloc(16 * 64, 64);
-
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         let start = bench_read_cycle();
         let _ = stat.set_ret(rme_cpt_crt(
             RME_BOOT_INIT_CPT,
@@ -2303,9 +2194,11 @@ Return      : None.
 fn bench_test_cpt_del(stat: &mut BenchStat) {
     stat.reset();
 
+    /* The table is deleted at the end of every round, so the same KOM
+     * address can be reused instead of consuming a new range per round. */
+    let raddr = bench_kom_alloc(16 * 64, 64);
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let raddr = bench_kom_alloc(16 * 64, 64);
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
             stat,
             "CPT_CRT delete target",
@@ -2342,7 +2235,7 @@ fn bench_test_cpt_frz(stat: &mut BenchStat) {
     stat.reset();
 
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(stat, "SIG_CRT freeze target", bench_sig_crt(CAP_TEST_SIG)) {
             break;
         }
@@ -2378,7 +2271,7 @@ fn bench_test_cpt_add(stat: &mut BenchStat) {
     stat.reset();
 
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         let start = bench_read_cycle();
         let _ = stat.set_ret(rme_cpt_add(
             RME_BOOT_INIT_CPT,
@@ -2420,7 +2313,7 @@ fn bench_test_cpt_rem(stat: &mut BenchStat) {
     stat.reset();
 
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
             stat,
             "CPT_ADD delegate leaf",
@@ -2458,10 +2351,11 @@ Return      : None.
 fn bench_test_pgt_crt(stat: &mut BenchStat) {
     stat.reset();
 
+    /* The table is deleted at the end of every round, so the same KOM
+     * address can be reused instead of consuming a new range per round. */
+    let raddr = bench_kom_alloc(0x1000, 0x1000);
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let raddr = bench_kom_alloc(0x1000, 0x1000);
-
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         let start = bench_read_cycle();
         let _ = stat.set_ret(bench_pgt_crt(CAP_TEST_PGT, raddr, 0, 0, RME_PGT_SIZE_4K) as i64);
         let end = bench_read_cycle();
@@ -2485,9 +2379,11 @@ Return      : None.
 fn bench_test_pgt_del(stat: &mut BenchStat) {
     stat.reset();
 
+    /* The table is deleted at the end of every round, so the same KOM
+     * address can be reused instead of consuming a new range per round. */
+    let raddr = bench_kom_alloc(0x1000, 0x1000);
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let raddr = bench_kom_alloc(0x1000, 0x1000);
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
             stat,
             "PGT_CRT delete target",
@@ -2517,11 +2413,11 @@ Return      : None.
 fn bench_test_pgt_add(stat: &mut BenchStat) {
     stat.reset();
 
+    /* The table is created and deleted inside every round, so the same KOM
+     * address can be reused instead of consuming a new range per round. */
+    let raddr = bench_kom_alloc(0x1000, 0x1000);
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        /* PGT_REM is broken in the current kernel, so create a fresh table
-         * for each round and delete it untimed instead of unmapping. */
-        let raddr = bench_kom_alloc(0x1000, 0x1000);
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
             stat,
             "PGT_CRT map target",
@@ -2563,7 +2459,7 @@ fn bench_test_pgt_rem(stat: &mut BenchStat) {
     stat.reset();
 
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
             stat,
             "PGT_ADD mapped page",
@@ -2602,39 +2498,42 @@ fn bench_test_pgt_con(stat: &mut BenchStat) {
         return;
     }
 
-    /* PGT_DES is broken in the current kernel, so each child can only be
-     * connected once. Create one child per parent slot and connect each. */
-    let mut i: u64 = 0;
-    while i < BENCH_PGT_CON_ROUNDS {
-        let child_raddr = bench_kom_alloc(0x1000, 0x1000);
-        if !bench_setup_try(
-            stat,
-            "PGT_CRT connect child",
-            bench_pgt_crt(
-                CAP_TEST_PGT_CHILD_BASE + i,
-                child_raddr,
-                i << RME_PGT_SIZE_2M,
-                0,
-                RME_PGT_SIZE_4K,
-            ),
-        ) {
-            return;
-        }
-        i += 1;
+    let child_raddr = bench_kom_alloc(0x1000, 0x1000);
+    if !bench_setup_try(
+        stat,
+        "PGT_CRT connect child",
+        bench_pgt_crt(CAP_TEST_PGT_CHILD_BASE, child_raddr, 0, 0, RME_PGT_SIZE_4K),
+    ) {
+        return;
     }
 
     stat.reset();
 
-    i = 0;
-    while i < BENCH_PGT_CON_ROUNDS && stat.fail == 0 {
+    let mut count: u64 = 0;
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         let start = bench_read_cycle();
-        let _ = stat
-            .set_ret(bench_pgt_con(CAP_TEST_PGT_CON_PARENT, i, CAP_TEST_PGT_CHILD_BASE + i) as i64);
+        let _ =
+            stat.set_ret(bench_pgt_con(CAP_TEST_PGT_CON_PARENT, 0, CAP_TEST_PGT_CHILD_BASE) as i64);
         let end = bench_read_cycle();
 
         stat.record((end - start) as u32);
-        i += 1;
+
+        /* PGT_DES is the inverse operation. Disconnect outside the timing
+         * window so the next round can connect the same child again. */
+        if !bench_setup_try(
+            stat,
+            "PGT_DES disconnect child",
+            rme_pgt_des(CAP_TEST_PGT_CON_PARENT, 0, CAP_TEST_PGT_CHILD_BASE),
+        ) {
+            break;
+        }
+        count += 1;
     }
+
+    let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_PGT_CHILD_BASE);
+    let _ = rme_pgt_del(RME_BOOT_INIT_CPT, CAP_TEST_PGT_CHILD_BASE);
+    let _ = rme_cpt_frz(RME_BOOT_INIT_CPT, CAP_TEST_PGT_CON_PARENT);
+    let _ = rme_pgt_del(RME_BOOT_INIT_CPT, CAP_TEST_PGT_CON_PARENT);
 }
 /* End Function:bench_test_pgt_con *******************************************/
 
@@ -2665,7 +2564,7 @@ fn bench_test_pgt_des(stat: &mut BenchStat) {
     stat.reset();
 
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
             stat,
             "PGT_CON connected child",
@@ -2722,7 +2621,7 @@ fn bench_test_prc_crt(stat: &mut BenchStat) {
     stat.reset();
 
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         let start = bench_read_cycle();
         let _ =
             stat.set_ret(
@@ -2777,7 +2676,7 @@ fn bench_test_prc_del(stat: &mut BenchStat) {
     stat.reset();
 
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
             stat,
             "PRC_CRT process",
@@ -2856,7 +2755,7 @@ fn bench_test_prc_cpt(stat: &mut BenchStat) {
     stat.reset();
 
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         let start = bench_read_cycle();
         let _ = stat.set_ret(rme_prc_cpt(CAP_TEST_PRC, CAP_TEST_CPT2) as i64);
         let end = bench_read_cycle();
@@ -2932,7 +2831,7 @@ fn bench_test_prc_pgt(stat: &mut BenchStat) {
     stat.reset();
 
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         let start = bench_read_cycle();
         let _ = stat.set_ret(rme_prc_pgt(CAP_TEST_PRC, CAP_TEST_PGT2) as i64);
         let end = bench_read_cycle();
@@ -2969,10 +2868,11 @@ Return      : None.
 fn bench_test_thd_crt(stat: &mut BenchStat) {
     stat.reset();
 
+    /* The object is deleted at the end of every round, so the same KOM
+     * address can be reused instead of consuming a new range per round. */
+    let raddr = bench_kom_alloc(0x2000, 0x1000);
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let raddr = bench_kom_alloc(0x2000, 0x1000);
-
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         let start = bench_read_cycle();
         let _ =
             stat.set_ret(
@@ -2999,9 +2899,11 @@ Return      : None.
 fn bench_test_thd_del(stat: &mut BenchStat) {
     stat.reset();
 
+    /* The object is deleted at the end of every round, so the same KOM
+     * address can be reused instead of consuming a new range per round. */
+    let raddr = bench_kom_alloc(0x2000, 0x1000);
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let raddr = bench_kom_alloc(0x2000, 0x1000);
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
             stat,
             "THD_CRT delete target",
@@ -3031,9 +2933,11 @@ Return      : None.
 fn bench_test_thd_bind(stat: &mut BenchStat) {
     stat.reset();
 
+    /* The object is deleted at the end of every round, so the same KOM
+     * address can be reused instead of consuming a new range per round. */
+    let raddr = bench_kom_alloc(0x2000, 0x1000);
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let raddr = bench_kom_alloc(0x2000, 0x1000);
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
             stat,
             "THD_CRT bind target",
@@ -3067,9 +2971,11 @@ Return      : None.
 fn bench_test_thd_free(stat: &mut BenchStat) {
     stat.reset();
 
+    /* The object is deleted at the end of every round, so the same KOM
+     * address can be reused instead of consuming a new range per round. */
+    let raddr = bench_kom_alloc(0x2000, 0x1000);
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let raddr = bench_kom_alloc(0x2000, 0x1000);
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
             stat,
             "THD_CRT free target",
@@ -3112,9 +3018,11 @@ fn bench_test_thd_exec_set(stat: &mut BenchStat) {
     });
     stat.reset();
 
+    /* The object is deleted at the end of every round, so the same KOM
+     * address can be reused instead of consuming a new range per round. */
+    let raddr = bench_kom_alloc(0x2000, 0x1000);
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let raddr = bench_kom_alloc(0x2000, 0x1000);
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
             stat,
             "THD_CRT exec_set target",
@@ -3155,9 +3063,11 @@ Return      : None.
 fn bench_test_thd_prio(stat: &mut BenchStat) {
     stat.reset();
 
+    /* The object is deleted at the end of every round, so the same KOM
+     * address can be reused instead of consuming a new range per round. */
+    let raddr = bench_kom_alloc(0x2000, 0x1000);
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let raddr = bench_kom_alloc(0x2000, 0x1000);
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
             stat,
             "THD_CRT prio target",
@@ -3199,9 +3109,11 @@ Return      : None.
 fn bench_test_thd_time_xfer(stat: &mut BenchStat) {
     stat.reset();
 
+    /* The object is deleted at the end of every round, so the same KOM
+     * address can be reused instead of consuming a new range per round. */
+    let raddr = bench_kom_alloc(0x2000, 0x1000);
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let raddr = bench_kom_alloc(0x2000, 0x1000);
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
             stat,
             "THD_CRT time_xfer target",
@@ -3273,7 +3185,7 @@ fn bench_test_thd_sched_rcv(stat: &mut BenchStat) {
     }
 
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         /* Make the dummy thread time out and notify the init thread. */
         let drain = rme_thd_time_xfer(RME_BOOT_INIT_THD, cap_thd, u64::MAX);
         if (drain as i64) < 0 {
@@ -3312,7 +3224,7 @@ fn bench_test_sig_crt(stat: &mut BenchStat) {
     stat.reset();
 
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         let start = bench_read_cycle();
         let _ = stat.set_ret(bench_sig_crt(CAP_TEST_SIG) as i64);
         let end = bench_read_cycle();
@@ -3337,7 +3249,7 @@ fn bench_test_sig_del(stat: &mut BenchStat) {
     stat.reset();
 
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(stat, "SIG_CRT delete target", bench_sig_crt(CAP_TEST_SIG)) {
             break;
         }
@@ -3362,10 +3274,11 @@ Return      : None.
 fn bench_test_inv_crt(stat: &mut BenchStat) {
     stat.reset();
 
+    /* The object is deleted at the end of every round, so the same KOM
+     * address can be reused instead of consuming a new range per round. */
+    let raddr = bench_kom_alloc(0x2000, 0x1000);
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let raddr = bench_kom_alloc(0x2000, 0x1000);
-
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         let start = bench_read_cycle();
         let _ = stat.set_ret(rme_inv_crt(
             RME_BOOT_INIT_CPT,
@@ -3395,9 +3308,11 @@ Return      : None.
 fn bench_test_inv_del(stat: &mut BenchStat) {
     stat.reset();
 
+    /* The object is deleted at the end of every round, so the same KOM
+     * address can be reused instead of consuming a new range per round. */
+    let raddr = bench_kom_alloc(0x2000, 0x1000);
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let raddr = bench_kom_alloc(0x2000, 0x1000);
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         let _ = rme_inv_crt(
             RME_BOOT_INIT_CPT,
             RME_BOOT_INIT_KOM,
@@ -3430,9 +3345,11 @@ fn bench_test_inv_set(stat: &mut BenchStat) {
     });
     stat.reset();
 
+    /* The object is deleted at the end of every round, so the same KOM
+     * address can be reused instead of consuming a new range per round. */
+    let raddr = bench_kom_alloc(0x2000, 0x1000);
     let mut count: u64 = 0;
-    while count < BENCH_OBJ_LOOP_NUM && stat.fail == 0 {
-        let raddr = bench_kom_alloc(0x2000, 0x1000);
+    while count < BENCH_LOOP_NUM && stat.fail == 0 {
         let _ = rme_inv_crt(
             RME_BOOT_INIT_CPT,
             RME_BOOT_INIT_KOM,
