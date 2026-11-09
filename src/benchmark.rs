@@ -122,17 +122,41 @@ const PHASE_SIG_RECV2: u32 = 4; /* Process 2's helper receives and measures */
 const PHASE_SIG_RCV_ONLY: u32 = 5; /* Process 1's helper measures receive only */
 
 /* The kernel memory frontier for the objects the benchmark creates. The
- * kernel's boot-time objects occupy the first part of KOM, so the benchmark
- * starts allocating at 0x10000 (64KB) to stay clear of them. */
-/* The kernel memory frontier for the objects the benchmark creates. The
  * init image is physically at 0x81030000 and the 32-page mapping ends at
  * 0x81050000, i.e. KOM-relative 0x50000. Start above that to avoid
- * overwriting the image (and its .bss) with kernel objects. */
+ * overwriting the image (and its .bss) with kernel objects.
+ * Every kernel object the benchmark creates is carved out of this region by
+ * the bump allocator - the long-lived fixtures (the second process, its page
+ * tables, the helper threads, the invocation stubs) as well as the
+ * short-lived objects of the lifecycle/state tests. One frontier is enough,
+ * because the bump pointer hands out a distinct range to every object. */
 const BENCH_KOM_FRONTIER: RmePtr = 0x60000;
 
-/* The lifecycle/state tests allocate from a higher bump pointer so they never
- * overlap the process2/invocation objects above. */
-const BENCH_TEST_KOM_FRONTIER: RmePtr = 0x100000;
+/* The alignment every kernel object needs inside the KOM. The KOM hands out
+ * its objects in 64 byte slots (RME_KOM_SLOT_ORDER = 6), and _RME_Kot_Mark
+ * rejects an address that is not slot aligned. */
+const BENCH_KOM_ALIGN: RmePtr = 64;
+
+/* A page table needs 4KB alignment on top of that: Sv39 finds the table
+ * through its PPN, so the kernel rejects a misaligned one (__RME_Pgt_Check
+ * tests Vaddr & 0xFFF). */
+const BENCH_PGT_ALIGN: RmePtr = 0x1000;
+
+/* The sizes of the kernel objects the benchmark creates. The kernel marks
+ * exactly its own size in the KOT bitmap (_RME_Kot_Mark), so a request below
+ * the real size of the object is reported as RME_ERR_KOT_BMP at the next
+ * allocation. The margins below are headroom against a kernel-side growth:
+ *   PGT : RME_PGT_SIZE_NOM(9) = 512 entries x 8 B = 4096
+ *   THD : RME_THD_SIZE        = 728
+ *   INV : RME_INV_SIZE        = 72
+ * The size of a capability table is derived from its entry count instead,
+ * see bench_kom_alloc_cpt.
+ * The thread object holds the register context at offset 176 and the FPU
+ * context at offset 464, so it must stay 8 byte aligned for the FSD of the
+ * coprocessor save; the 64 byte slot alignment covers that. */
+const BENCH_PGT_SIZE: RmePtr = 0x1000;
+const BENCH_THD_SIZE: RmePtr = 0x2000;
+const BENCH_INV_SIZE: RmePtr = 0x1000;
 
 /* The number of timeslices the measuring thread donates to a helper thread.
  * It is deliberately large enough that a helper never runs out of time
@@ -267,11 +291,13 @@ static mut CAP_SIG_PARK: RmePtr = 0;
 static mut CAP_SIG_PARK2: RmePtr = 0;
 static mut CAP_SIG_DATA: RmePtr = 0;
 
-/* The monotonic KOM allocator for long-lived fixtures. Objects that are
- * created and deleted inside a test loop reuse one fixed address, because the
- * kernel frees their KOT range on deletion; bump-allocating every round would
+/* The monotonic KOM allocator. Every kernel object the benchmark creates is
+ * carved out of this bump pointer, the long-lived fixtures as well as the
+ * short-lived objects of the lifecycle/state tests. Objects that are created
+ * and deleted inside a test loop reuse one fixed address, because the kernel
+ * frees their KOT range on deletion; bump-allocating every round would
  * exhaust the KOM when the loop count is large. */
-static mut BENCH_KOM_NEXT: RmePtr = BENCH_TEST_KOM_FRONTIER;
+static mut BENCH_KOM_NEXT: RmePtr = BENCH_KOM_FRONTIER;
 /* End Private Variables *****************************************************/
 
 /* Function:bench_read_cycle ***************************************************
@@ -302,6 +328,10 @@ fn bench_read_cycle() -> u64 {
 Description : Allocate a distinct KOM range for a kernel object. The address is
               relative to the KOM capability's Begin, as the kernel expects.
               KOM is never reclaimed here; the bump pointer is enough.
+              The size must cover what the kernel writes into the object: the
+              kernel marks exactly its own size in the KOT bitmap, so a size
+              below that is not reported here but at the next allocation, as
+              RME_ERR_CPT_KOT. The alignment must be a power of two.
 Input       : size - The number of bytes needed.
               align - The required alignment.
 Output      : None.
@@ -310,14 +340,69 @@ Return      : RmePtr - The aligned relative KOM address.
 #[inline(always)]
 fn bench_kom_alloc(size: RmePtr, align: RmePtr) -> RmePtr {
     unsafe {
-        let mut addr = BENCH_KOM_NEXT;
-        addr = (addr + align - 1) & !(align - 1);
-        /* KOM allocation granularity is 64 bytes. */
-        BENCH_KOM_NEXT = addr + ((size + 63) & !63);
+        /* The address is rounded up to the requested alignment, and the bump
+         * pointer moves on by the size rounded up to the 64 byte slot of the
+         * KOM, so that the next object never overlaps this one. */
+        let addr = (BENCH_KOM_NEXT + align - 1) & !(align - 1);
+        BENCH_KOM_NEXT = addr + ((size + BENCH_KOM_ALIGN - 1) & !(BENCH_KOM_ALIGN - 1));
         addr
     }
 }
 /* End Function:bench_kom_alloc **********************************************/
+
+/* Function:bench_kom_alloc_cpt *********************************************
+Description : Allocate the kernel object of a capability table with the given
+              number of entries. The size is derived from the count, so the
+              object is never smaller than what the kernel writes into it.
+              NOTE: the same count has to be passed to CPT_CRT - the kernel
+              writes exactly Entry_Num slots into the object, so the two
+              numbers must agree.
+Input       : entry_num - The number of entries of the table.
+Output      : None.
+Return      : RmePtr - The relative KOM address of the new table.
+*****************************************************************************/
+#[inline(always)]
+fn bench_kom_alloc_cpt(entry_num: RmePtr) -> RmePtr {
+    /* One entry is 64 bytes: Cap_Head (5 words) + Info[3]. */
+    bench_kom_alloc(entry_num * 64, BENCH_KOM_ALIGN)
+}
+/* End Function:bench_kom_alloc_cpt *****************************************/
+
+/* Function:bench_kom_alloc_pgt *********************************************
+Description : Allocate the kernel object of a page table.
+Input       : None.
+Output      : None.
+Return      : RmePtr - The relative KOM address of the new table.
+*****************************************************************************/
+#[inline(always)]
+fn bench_kom_alloc_pgt() -> RmePtr {
+    bench_kom_alloc(BENCH_PGT_SIZE, BENCH_PGT_ALIGN)
+}
+/* End Function:bench_kom_alloc_pgt *****************************************/
+
+/* Function:bench_kom_alloc_thd *********************************************
+Description : Allocate the kernel object of a thread.
+Input       : None.
+Output      : None.
+Return      : RmePtr - The relative KOM address of the new thread.
+*****************************************************************************/
+#[inline(always)]
+fn bench_kom_alloc_thd() -> RmePtr {
+    bench_kom_alloc(BENCH_THD_SIZE, BENCH_KOM_ALIGN)
+}
+/* End Function:bench_kom_alloc_thd *****************************************/
+
+/* Function:bench_kom_alloc_inv *********************************************
+Description : Allocate the kernel object of an invocation stub.
+Input       : None.
+Output      : None.
+Return      : RmePtr - The relative KOM address of the new stub.
+*****************************************************************************/
+#[inline(always)]
+fn bench_kom_alloc_inv() -> RmePtr {
+    bench_kom_alloc(BENCH_INV_SIZE, BENCH_KOM_ALIGN)
+}
+/* End Function:bench_kom_alloc_inv *****************************************/
 
 /* Function:bench_print_char ***************************************************
 Description : Print one character by invoking the DEBUG_PRINT kernel function.
@@ -721,15 +806,21 @@ fn bench_report(title: &str, stat: &BenchStat) {
 /* End Function:bench_report *************************************************/
 
 /* Function:bench_stack_top *************************************************
-Description : Compute the stack pointer of a helper thread. The RISC-V ABI
-              requires the stack pointer to be 16 byte aligned.
-Input       : base - The address of the last word of the stack array.
+Description : Compute the stack pointer of a helper thread or of an
+              invocation stub. The RISC-V stack grows downwards, so the
+              initial stack pointer is one past the end of the stack. The
+              RISC-V ABI requires the stack pointer to be 16 byte aligned,
+              and the kernel uses the value verbatim, so the alignment is
+              fixed up here. The fixup rounds the pointer down, which keeps
+              the stack inside its own array - rounding up would place the
+              stack pointer past the end, into whatever follows in the bss.
+Input       : stack - A pointer to the stack array.
 Output      : None.
 Return      : u64 - The stack pointer.
 *****************************************************************************/
 #[inline(always)]
-fn bench_stack_top(base: u64) -> u64 {
-    (base + 8) & !0xF
+fn bench_stack_top<const N: usize>(stack: *const [u64; N]) -> u64 {
+    (stack.cast::<u64>() as u64 + (N as u64) * 8) & !0xF
 }
 /* End Function:bench_stack_top *********************************************/
 
@@ -1167,12 +1258,12 @@ Return      : None - A failed setup step halts the benchmark, so this
               function never returns in that case.
 *****************************************************************************/
 fn bench_prepare_process2() {
-    let mut raddr: u64;
-
     /* ---- Create the new process's capability table (16 entries) ---- */
     /* CPT_CRT: Cid=Cap_Cpt_Crt, Param0=D1(Cap_Kom)|D0(Cap_Crt),
-     * Param1=Raddr, Param2=Entry_Num */
-    raddr = BENCH_KOM_FRONTIER;
+     * Param1=Raddr, Param2=Entry_Num
+     * The table holds the delegated caps in slots 0..6 (CAP2_*). It is not the
+     * init capability table, which the boot code creates with 64 entries. */
+    let raddr = bench_kom_alloc_cpt(16);
     bench_setup_check(
         "CPT_CRT process2 captbl",
         rme_cpt_crt(
@@ -1183,29 +1274,27 @@ fn bench_prepare_process2() {
             16,
         ),
     );
-    raddr += 0x400;
 
     /* ---- Create the new process's page tables (root + L1 + L2) ---- */
     /* Root: 1GB entries, covers the low half. Raddr must be 4KB aligned
      * because Sv39 finds a table through its PPN. */
-    raddr = (raddr + 0xFFF) & !0xFFF;
+    let raddr = bench_kom_alloc_pgt();
     bench_setup_check(
         "PGT_CRT process2 root",
         bench_pgt_crt(CAP_BENCH_PGT_TOP_NEW, raddr, 0, 1, RME_PGT_SIZE_1G),
     );
-    raddr += 0x1000;
     /* L1: 2MB entries, covers the user window [0,1GB) */
+    let raddr = bench_kom_alloc_pgt();
     bench_setup_check(
         "PGT_CRT process2 L1",
         bench_pgt_crt(CAP_BENCH_PGT_L1, raddr, 0, 0, RME_PGT_SIZE_2M),
     );
-    raddr += 0x1000;
     /* L2: 4KB entries, covers [0x20000000,0x20200000) */
+    let raddr = bench_kom_alloc_pgt();
     bench_setup_check(
         "PGT_CRT process2 L2",
         bench_pgt_crt(CAP_BENCH_PGT_L2, raddr, 0x20000000, 0, RME_PGT_SIZE_4K),
     );
-    raddr += 0x1000;
 
     /* ---- Connect the tables (build the address space tree) ---- */
     /* root[0] -> L1 (0x20000000>>30 = 0) */
@@ -1248,30 +1337,30 @@ fn bench_prepare_process2() {
      * Param1=D1(Cap_Prc)|D0(Prio_Max), Param2=Raddr.
      * Cid now points at the NEW captbl, so the new thread's cap slot is
      * created in the new process' independent capability namespace. */
-    raddr = (raddr + 0xFFF) & !0xFFF;
+    let raddr = bench_kom_alloc_thd();
     bench_setup_check(
         "THD_CRT process2 receiver",
         bench_thd_crt(CAP_BENCH_CPT, CAP2_THD, CAP_BENCH_PRC, raddr),
     );
-    raddr += 0x1000;
 
     /* ---- Create the switch target thread in the new process' OWN captbl ---- */
+    let raddr = bench_kom_alloc_thd();
     bench_setup_check(
         "THD_CRT process2 switch target",
         bench_thd_crt(CAP_BENCH_CPT, CAP2_THD2, CAP_BENCH_PRC, raddr),
     );
-    raddr += 0x1000;
 
     /* ---- Create the helper thread of the init process ---- */
+    let raddr = bench_kom_alloc_thd();
     bench_setup_check(
         "THD_CRT init process receiver",
         bench_thd_crt(RME_BOOT_INIT_CPT, CAP_BENCH_THD, RME_BOOT_INIT_PRC, raddr),
     );
-    raddr += 0x1000;
 
     /* ---- Create the switch target of the init process ---- */
     /* It shares the init process' capability table, so no delegation is
      * needed for it. */
+    let raddr = bench_kom_alloc_thd();
     bench_setup_check(
         "THD_CRT init process switch target",
         bench_thd_crt(RME_BOOT_INIT_CPT, CAP_BENCH_THD2, RME_BOOT_INIT_PRC, raddr),
@@ -1415,7 +1504,7 @@ Return      : None - A failed setup step halts the benchmark, so this
 fn bench_prepare_invocation() {
     /* The invocation stub object lives in the kernel memory, right behind the
      * thread objects the preparation has allocated so far. */
-    let raddr: u64 = BENCH_KOM_FRONTIER + 0x18000;
+    let raddr = bench_kom_alloc_inv();
 
     /* INV_CRT: Cid=Cap_Cpt, Param0=D1(Cap_Kom)|D0(Cap_Inv), Param1=Cap_Prc,
      * Param2=Raddr. The target process is the second process. */
@@ -1434,9 +1523,7 @@ fn bench_prepare_invocation() {
      * The stack lives in the init image's bss, which the second process
      * maps physically one to one. */
     let entry = bench_inv_entry as extern "C" fn(u64) -> ! as u64;
-    let stack = bench_stack_top(unsafe {
-        core::ptr::addr_of!(BENCH_STACK_INV[BENCH_STACK_WORD_NUM - 1]) as u64
-    });
+    let stack = bench_stack_top(&raw const BENCH_STACK_INV);
     bench_setup_check(
         "INV_SET round-trip stub",
         rme_inv_set(
@@ -1449,7 +1536,7 @@ fn bench_prepare_invocation() {
 
     /* The second stub is used by the one-way INV_ACT test and as the inner
      * stub of the nested INV_RET test. */
-    let raddr2: u64 = BENCH_KOM_FRONTIER + 0x19000;
+    let raddr2 = bench_kom_alloc_inv();
     bench_setup_check(
         "INV_CRT one-way stub",
         rme_inv_crt(
@@ -1461,9 +1548,7 @@ fn bench_prepare_invocation() {
         ),
     );
     let entry2 = bench_inv_act_entry as extern "C" fn(u64) -> ! as u64;
-    let stack2 = bench_stack_top(unsafe {
-        core::ptr::addr_of!(BENCH_STACK_INV2[BENCH_STACK_WORD_NUM - 1]) as u64
-    });
+    let stack2 = bench_stack_top(&raw const BENCH_STACK_INV2);
     bench_setup_check(
         "INV_SET one-way stub",
         rme_inv_set(
@@ -1524,9 +1609,7 @@ fn bench_prepare_threads() {
         bench_thd_bind(cap_p1t2, BENCH_PRIO_RECV),
     );
     let entry = bench_p1t2_entry as extern "C" fn(u64) -> ! as u64;
-    let stack = bench_stack_top(unsafe {
-        core::ptr::addr_of!(BENCH_STACK_P1T2[BENCH_STACK_WORD_NUM - 1]) as u64
-    });
+    let stack = bench_stack_top(&raw const BENCH_STACK_P1T2);
     bench_setup_check(
         "THD_EXEC_SET init process receiver",
         rme_thd_exec_set(cap_p1t2, entry, stack, 0),
@@ -1539,9 +1622,7 @@ fn bench_prepare_threads() {
         bench_thd_bind(cap_p2t1, BENCH_PRIO_RECV2),
     );
     let entry = bench_p2t1_entry as extern "C" fn(u64) -> ! as u64;
-    let stack = bench_stack_top(unsafe {
-        core::ptr::addr_of!(BENCH_STACK_P2T1[BENCH_STACK_WORD_NUM - 1]) as u64
-    });
+    let stack = bench_stack_top(&raw const BENCH_STACK_P2T1);
     bench_setup_check(
         "THD_EXEC_SET process2 receiver",
         rme_thd_exec_set(cap_p2t1, entry, stack, 0),
@@ -1554,9 +1635,7 @@ fn bench_prepare_threads() {
         bench_thd_bind(cap_p2t2, BENCH_PRIO_INIT),
     );
     let entry = bench_p2t2_entry as extern "C" fn(u64) -> ! as u64;
-    let stack = bench_stack_top(unsafe {
-        core::ptr::addr_of!(BENCH_STACK_P2T2[BENCH_STACK_WORD_NUM - 1]) as u64
-    });
+    let stack = bench_stack_top(&raw const BENCH_STACK_P2T2);
     bench_setup_check(
         "THD_EXEC_SET process2 switch target",
         rme_thd_exec_set(cap_p2t2, entry, stack, 0),
@@ -1569,9 +1648,7 @@ fn bench_prepare_threads() {
         bench_thd_bind(cap_p1t3, BENCH_PRIO_INIT),
     );
     let entry = bench_p1t3_entry as extern "C" fn(u64) -> ! as u64;
-    let stack = bench_stack_top(unsafe {
-        core::ptr::addr_of!(BENCH_STACK_P1T3[BENCH_STACK_WORD_NUM - 1]) as u64
-    });
+    let stack = bench_stack_top(&raw const BENCH_STACK_P1T3);
     bench_setup_check(
         "THD_EXEC_SET init process switch target",
         rme_thd_exec_set(cap_p1t3, entry, stack, 0),
@@ -1800,9 +1877,7 @@ Return      : None.
 fn bench_test_inv_act(stat: &mut BenchStat) {
     let cap_inv2 = rme_cid_2l(RME_BOOT_INIT_CPT, CAP_BENCH_INV2);
     let entry = bench_inv_act_entry as extern "C" fn(u64) -> ! as u64;
-    let stack = bench_stack_top(unsafe {
-        core::ptr::addr_of!(BENCH_STACK_INV2[BENCH_STACK_WORD_NUM - 1]) as u64
-    });
+    let stack = bench_stack_top(&raw const BENCH_STACK_INV2);
     if !bench_setup_try(
         stat,
         "INV_SET one-way stub",
@@ -1839,12 +1914,8 @@ fn bench_test_inv_ret(stat: &mut BenchStat) {
     let cap_inv2 = rme_cid_2l(RME_BOOT_INIT_CPT, CAP_BENCH_INV2);
     let entry1 = bench_inv_nest_entry as extern "C" fn(u64) -> ! as u64;
     let entry2 = bench_inv_ret_entry as extern "C" fn(u64) -> ! as u64;
-    let stack1 = bench_stack_top(unsafe {
-        core::ptr::addr_of!(BENCH_STACK_INV[BENCH_STACK_WORD_NUM - 1]) as u64
-    });
-    let stack2 = bench_stack_top(unsafe {
-        core::ptr::addr_of!(BENCH_STACK_INV2[BENCH_STACK_WORD_NUM - 1]) as u64
-    });
+    let stack1 = bench_stack_top(&raw const BENCH_STACK_INV);
+    let stack2 = bench_stack_top(&raw const BENCH_STACK_INV2);
     if !bench_setup_try(
         stat,
         "INV_SET nested outer stub",
@@ -2188,7 +2259,7 @@ fn bench_test_cpt_crt(stat: &mut BenchStat) {
 
     /* The table is deleted at the end of every round, so the same KOM
      * address can be reused instead of consuming a new range per round. */
-    let raddr = bench_kom_alloc(16 * 64, 64);
+    let raddr = bench_kom_alloc_cpt(16);
     let mut count: u64 = 0;
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
         let start = bench_read_cycle();
@@ -2222,7 +2293,7 @@ fn bench_test_cpt_del(stat: &mut BenchStat) {
 
     /* The table is deleted at the end of every round, so the same KOM
      * address can be reused instead of consuming a new range per round. */
-    let raddr = bench_kom_alloc(16 * 64, 64);
+    let raddr = bench_kom_alloc_cpt(16);
     let mut count: u64 = 0;
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
@@ -2391,7 +2462,7 @@ fn bench_test_pgt_crt(stat: &mut BenchStat) {
 
     /* The table is deleted at the end of every round, so the same KOM
      * address can be reused instead of consuming a new range per round. */
-    let raddr = bench_kom_alloc(0x1000, 0x1000);
+    let raddr = bench_kom_alloc_pgt();
     let mut count: u64 = 0;
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
         let start = bench_read_cycle();
@@ -2419,7 +2490,7 @@ fn bench_test_pgt_del(stat: &mut BenchStat) {
 
     /* The table is deleted at the end of every round, so the same KOM
      * address can be reused instead of consuming a new range per round. */
-    let raddr = bench_kom_alloc(0x1000, 0x1000);
+    let raddr = bench_kom_alloc_pgt();
     let mut count: u64 = 0;
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
@@ -2459,7 +2530,7 @@ fn bench_test_pgt_add(stat: &mut BenchStat) {
 
     /* The table is created and deleted inside every round, so the same KOM
      * address can be reused instead of consuming a new range per round. */
-    let raddr = bench_kom_alloc(0x1000, 0x1000);
+    let raddr = bench_kom_alloc_pgt();
     let mut count: u64 = 0;
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
@@ -2491,7 +2562,7 @@ Output      : None.
 Return      : None.
 *****************************************************************************/
 fn bench_test_pgt_rem(stat: &mut BenchStat) {
-    let raddr = bench_kom_alloc(0x1000, 0x1000);
+    let raddr = bench_kom_alloc_pgt();
     if !bench_setup_try(
         stat,
         "PGT_CRT unmap target",
@@ -2533,7 +2604,7 @@ Output      : None.
 Return      : None.
 *****************************************************************************/
 fn bench_test_pgt_con(stat: &mut BenchStat) {
-    let parent_raddr = bench_kom_alloc(0x1000, 0x1000);
+    let parent_raddr = bench_kom_alloc_pgt();
     if !bench_setup_try(
         stat,
         "PGT_CRT connect parent",
@@ -2542,7 +2613,7 @@ fn bench_test_pgt_con(stat: &mut BenchStat) {
         return;
     }
 
-    let child_raddr = bench_kom_alloc(0x1000, 0x1000);
+    let child_raddr = bench_kom_alloc_pgt();
     if !bench_setup_try(
         stat,
         "PGT_CRT connect child",
@@ -2589,8 +2660,8 @@ Output      : None.
 Return      : None.
 *****************************************************************************/
 fn bench_test_pgt_des(stat: &mut BenchStat) {
-    let parent_raddr = bench_kom_alloc(0x1000, 0x1000);
-    let child_raddr = bench_kom_alloc(0x1000, 0x1000);
+    let parent_raddr = bench_kom_alloc_pgt();
+    let child_raddr = bench_kom_alloc_pgt();
     if !bench_setup_try(
         stat,
         "PGT_CRT disconnect parent",
@@ -2640,8 +2711,8 @@ Output      : None.
 Return      : None.
 *****************************************************************************/
 fn bench_test_prc_crt(stat: &mut BenchStat) {
-    let cpt_raddr = bench_kom_alloc(16 * 64, 64);
-    let pgt_raddr = bench_kom_alloc(0x1000, 0x1000);
+    let cpt_raddr = bench_kom_alloc_cpt(16);
+    let pgt_raddr = bench_kom_alloc_pgt();
     if !bench_setup_try(
         stat,
         "CPT_CRT process captbl",
@@ -2695,8 +2766,8 @@ Output      : None.
 Return      : None.
 *****************************************************************************/
 fn bench_test_prc_del(stat: &mut BenchStat) {
-    let cpt_raddr = bench_kom_alloc(16 * 64, 64);
-    let pgt_raddr = bench_kom_alloc(0x1000, 0x1000);
+    let cpt_raddr = bench_kom_alloc_cpt(16);
+    let pgt_raddr = bench_kom_alloc_pgt();
     if !bench_setup_try(
         stat,
         "CPT_CRT process captbl",
@@ -2759,9 +2830,9 @@ Output      : None.
 Return      : None.
 *****************************************************************************/
 fn bench_test_prc_cpt(stat: &mut BenchStat) {
-    let cpt_a_raddr = bench_kom_alloc(16 * 64, 64);
-    let cpt_b_raddr = bench_kom_alloc(16 * 64, 64);
-    let pgt_raddr = bench_kom_alloc(0x1000, 0x1000);
+    let cpt_a_raddr = bench_kom_alloc_cpt(16);
+    let cpt_b_raddr = bench_kom_alloc_cpt(16);
+    let pgt_raddr = bench_kom_alloc_pgt();
     if !bench_setup_try(
         stat,
         "CPT_CRT switch target A",
@@ -2841,9 +2912,9 @@ Output      : None.
 Return      : None.
 *****************************************************************************/
 fn bench_test_prc_pgt(stat: &mut BenchStat) {
-    let cpt_raddr = bench_kom_alloc(16 * 64, 64);
-    let pgt_a_raddr = bench_kom_alloc(0x1000, 0x1000);
-    let pgt_b_raddr = bench_kom_alloc(0x1000, 0x1000);
+    let cpt_raddr = bench_kom_alloc_cpt(16);
+    let pgt_a_raddr = bench_kom_alloc_pgt();
+    let pgt_b_raddr = bench_kom_alloc_pgt();
     if !bench_setup_try(
         stat,
         "CPT_CRT switch process captbl",
@@ -2920,7 +2991,7 @@ fn bench_test_thd_crt(stat: &mut BenchStat) {
 
     /* The object is deleted at the end of every round, so the same KOM
      * address can be reused instead of consuming a new range per round. */
-    let raddr = bench_kom_alloc(0x2000, 0x1000);
+    let raddr = bench_kom_alloc_thd();
     let mut count: u64 = 0;
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
         let start = bench_read_cycle();
@@ -2951,7 +3022,7 @@ fn bench_test_thd_del(stat: &mut BenchStat) {
 
     /* The object is deleted at the end of every round, so the same KOM
      * address can be reused instead of consuming a new range per round. */
-    let raddr = bench_kom_alloc(0x2000, 0x1000);
+    let raddr = bench_kom_alloc_thd();
     let mut count: u64 = 0;
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
@@ -2991,7 +3062,7 @@ fn bench_test_thd_bind(stat: &mut BenchStat) {
 
     /* The object is deleted at the end of every round, so the same KOM
      * address can be reused instead of consuming a new range per round. */
-    let raddr = bench_kom_alloc(0x2000, 0x1000);
+    let raddr = bench_kom_alloc_thd();
     let mut count: u64 = 0;
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
@@ -3029,7 +3100,7 @@ fn bench_test_thd_free(stat: &mut BenchStat) {
 
     /* The object is deleted at the end of every round, so the same KOM
      * address can be reused instead of consuming a new range per round. */
-    let raddr = bench_kom_alloc(0x2000, 0x1000);
+    let raddr = bench_kom_alloc_thd();
     let mut count: u64 = 0;
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
@@ -3069,14 +3140,12 @@ Return      : None.
 *****************************************************************************/
 fn bench_test_thd_exec_set(stat: &mut BenchStat) {
     let entry = bench_noop_entry as extern "C" fn(u64) -> ! as u64;
-    let stack = bench_stack_top(unsafe {
-        core::ptr::addr_of!(BENCH_STACK_TEST[BENCH_STACK_WORD_NUM - 1]) as u64
-    });
+    let stack = bench_stack_top(&raw const BENCH_STACK_TEST);
     stat.reset();
 
     /* The object is deleted at the end of every round, so the same KOM
      * address can be reused instead of consuming a new range per round. */
-    let raddr = bench_kom_alloc(0x2000, 0x1000);
+    let raddr = bench_kom_alloc_thd();
     let mut count: u64 = 0;
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
@@ -3121,7 +3190,7 @@ fn bench_test_thd_prio(stat: &mut BenchStat) {
 
     /* The object is deleted at the end of every round, so the same KOM
      * address can be reused instead of consuming a new range per round. */
-    let raddr = bench_kom_alloc(0x2000, 0x1000);
+    let raddr = bench_kom_alloc_thd();
     let mut count: u64 = 0;
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
@@ -3167,7 +3236,7 @@ fn bench_test_thd_time_xfer(stat: &mut BenchStat) {
 
     /* The object is deleted at the end of every round, so the same KOM
      * address can be reused instead of consuming a new range per round. */
-    let raddr = bench_kom_alloc(0x2000, 0x1000);
+    let raddr = bench_kom_alloc_thd();
     let mut count: u64 = 0;
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
@@ -3209,7 +3278,7 @@ Output      : None.
 Return      : None.
 *****************************************************************************/
 fn bench_test_thd_sched_rcv(stat: &mut BenchStat) {
-    let raddr = bench_kom_alloc(0x2000, 0x1000);
+    let raddr = bench_kom_alloc_thd();
     if !bench_setup_try(
         stat,
         "THD_CRT sched_rcv dummy",
@@ -3338,7 +3407,7 @@ fn bench_test_inv_crt(stat: &mut BenchStat) {
 
     /* The object is deleted at the end of every round, so the same KOM
      * address can be reused instead of consuming a new range per round. */
-    let raddr = bench_kom_alloc(0x2000, 0x1000);
+    let raddr = bench_kom_alloc_inv();
     let mut count: u64 = 0;
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
         let start = bench_read_cycle();
@@ -3372,7 +3441,7 @@ fn bench_test_inv_del(stat: &mut BenchStat) {
 
     /* The object is deleted at the end of every round, so the same KOM
      * address can be reused instead of consuming a new range per round. */
-    let raddr = bench_kom_alloc(0x2000, 0x1000);
+    let raddr = bench_kom_alloc_inv();
     let mut count: u64 = 0;
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
@@ -3414,14 +3483,12 @@ Return      : None.
 *****************************************************************************/
 fn bench_test_inv_set(stat: &mut BenchStat) {
     let entry = bench_inv_entry as extern "C" fn(u64) -> ! as u64;
-    let stack = bench_stack_top(unsafe {
-        core::ptr::addr_of!(BENCH_STACK_INV[BENCH_STACK_WORD_NUM - 1]) as u64
-    });
+    let stack = bench_stack_top(&raw const BENCH_STACK_INV);
     stat.reset();
 
     /* The object is deleted at the end of every round, so the same KOM
      * address can be reused instead of consuming a new range per round. */
-    let raddr = bench_kom_alloc(0x2000, 0x1000);
+    let raddr = bench_kom_alloc_inv();
     let mut count: u64 = 0;
     while count < BENCH_LOOP_NUM && stat.fail == 0 {
         if !bench_setup_try(
@@ -3693,9 +3760,7 @@ Return      : None.
 *****************************************************************************/
 fn bench_test_kfn_debug_inv_mod(stat: &mut BenchStat) {
     let cap_inv = rme_cid_2l(RME_BOOT_INIT_CPT, CAP_BENCH_INV);
-    let stack = bench_stack_top(unsafe {
-        core::ptr::addr_of!(BENCH_STACK_INV[BENCH_STACK_WORD_NUM - 1]) as u64
-    });
+    let stack = bench_stack_top(&raw const BENCH_STACK_INV);
     let entry = bench_inv_dbg_entry as extern "C" fn(u64) -> ! as u64;
     if !bench_setup_try(
         stat,
@@ -3823,6 +3888,12 @@ pub fn bench_main() -> ! {
     bench_test_thd_sched_rcv(&mut stat);
     bench_report("THD_SCHED_RCV", &stat);
 
+    /* The tick preemption test wakes the process-1 helper up on its parking
+     * endpoint, so the helper has to be parked - it has been since the
+     * preparation. */
+    bench_test_tick_preempt(&mut stat);
+    bench_report("THD_TIME_XFER+THD_SCHED_RCV(tick preempt)", &stat);
+
     /* ---- Signal: operations and object lifecycle ---- */
     bench_test_sig_crt(&mut stat);
     bench_report("SIG_CRT", &stat);
@@ -3843,11 +3914,6 @@ pub fn bench_main() -> ! {
 
     bench_test_sig_del(&mut stat);
     bench_report("SIG_DEL", &stat);
-
-    /* The tick preemption test reuses the process-1 helper after the signal
-     * tests have parked it again. */
-    bench_test_tick_preempt(&mut stat);
-    bench_report("THD_TIME_XFER+THD_SCHED_RCV(tick preempt)", &stat);
 
     /* ---- Invocation: operations and object lifecycle ---- */
     bench_test_inv_crt(&mut stat);
