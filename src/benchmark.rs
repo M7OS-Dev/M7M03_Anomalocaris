@@ -324,6 +324,32 @@ fn bench_read_cycle() -> u64 {
 }
 /* End Function:bench_read_cycle ***********************************************/
 
+/* Function:bench_read_time ****************************************************
+Description : Read the RISC-V wall-clock time counter. Unlike the cycle CSR,
+              the time CSR runs from an always-on timebase and keeps counting
+              while the hart is stopped in WFI, so it is the correct instrument
+              for measurements that span a sleep. The tick rate is platform
+              specific: QEMU virt uses 10 MHz, SpacemiT K3 uses 24 MHz.
+Input       : None.
+Output      : None.
+Return      : u64 - The current time count (platform timebase ticks).
+*****************************************************************************/
+#[inline(always)]
+fn bench_read_time() -> u64 {
+    let time: u64;
+
+    unsafe {
+        core::arch::asm!(
+            "csrr {0}, time",
+            out(reg) time,
+            options(nostack),
+        );
+    }
+
+    time
+}
+/* End Function:bench_read_time ***********************************************/
+
 /* Function:bench_kom_alloc **************************************************
 Description : Allocate a distinct KOM range for a kernel object. The address is
               relative to the KOM capability's Begin, as the kernel expects.
@@ -3803,21 +3829,32 @@ fn bench_test_kfn_debug_inv_mod(stat: &mut BenchStat) {
 
 /* Function:bench_test_kfn_idle_sleep ***************************************
 Description : Measure KFN IDLE_SLEEP. The kernel executes WFI and returns on
-              the next timer tick, so the result includes the sleep latency.
-Input       : stat - The statistics accumulator.
+              the next timer tick, so the result should include the sleep
+              latency. The cycle CSR is also recorded for comparison, but on
+              cores that clock-gate the hart in WFI (SpacemiT K3/X100) it does
+              not advance during the sleep and therefore only shows the SVC
+              round trip; the time CSR is the authoritative number there.
+Input       : stat - The cycle statistics accumulator.
+              time_stat - The time (timebase tick) statistics accumulator.
 Output      : None.
 Return      : None.
 *****************************************************************************/
-fn bench_test_kfn_idle_sleep(stat: &mut BenchStat) {
+fn bench_test_kfn_idle_sleep(stat: &mut BenchStat, time_stat: &mut BenchStat) {
     stat.reset();
+    time_stat.reset();
 
     let mut count: u64 = 0;
     while count < BENCH_LOOP_REDUCED_NUM && stat.fail == 0 {
         let start = bench_read_cycle();
-        let _ = stat.set_ret(rme_kfn(RME_BOOT_INIT_KFN, RME_KFN_IDLE_SLEEP, 0, 0, 0) as i64);
+        let time_start = bench_read_time();
+        let ret = rme_kfn(RME_BOOT_INIT_KFN, RME_KFN_IDLE_SLEEP, 0, 0, 0) as i64;
+        let time_end = bench_read_time();
         let end = bench_read_cycle();
 
+        let _ = stat.set_ret(ret);
+        let _ = time_stat.set_ret(ret);
         stat.record((end - start) as u32);
+        time_stat.record((time_end - time_start) as u32);
         count += 1;
     }
 }
@@ -3833,6 +3870,7 @@ Return      : ! - This function never returns.
 *****************************************************************************/
 pub fn bench_main() -> ! {
     let mut stat = BenchStat::new();
+    let mut time_stat = BenchStat::new();
 
     /* Print table header - the banner is generated with
      * "figlet -f smslant -k RME" */
@@ -4024,8 +4062,9 @@ pub fn bench_main() -> ! {
     bench_test_kfn_debug_inv_mod(&mut stat);
     bench_report("KFN(DEBUG_INV_MOD sp)", &stat);
 
-    bench_test_kfn_idle_sleep(&mut stat);
-    bench_report("KFN(IDLE_SLEEP tick)", &stat);
+    bench_test_kfn_idle_sleep(&mut stat, &mut time_stat);
+    bench_report("KFN(IDLE_SLEEP tick, cycle CSR)", &stat);
+    bench_report("KFN(IDLE_SLEEP tick, time CSR)", &time_stat);
 
     bench_print_str("\r\nRME BENCH REPORT OK\r\n");
 
