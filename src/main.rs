@@ -19,15 +19,16 @@ Description : The first user-mode program (init) for the RV64V port on
 /* Attribute *****************************************************************/
 #![no_std]
 #![no_main]
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
 /* End Attribute *************************************************************/
 
 /* Include *******************************************************************/
-mod benchmark;
-mod syscall;
+mod rme_benchmark;
+mod rme_syscall;
 
 use core::panic::PanicInfo;
 
-use benchmark::{bench_main, bench_print_char};
+use rme_benchmark::{RME_Bench_Print_Char, RME_Benchmark};
 /* End Include ***************************************************************/
 
 /* Entry:_start ***************************************************************
@@ -88,24 +89,24 @@ Description : The entry point of the init program. CPU0 runs the benchmark
               suite, whose static data has a single owner; every secondary
               hart prints a-z once and then idles, which still proves that all
               harts reach user mode.
-Input       : cpuid - The logical CPU index passed in a0 by the kernel.
+Input       : CPUID - The logical CPU index passed in a0 by the kernel.
 Output      : None.
 Return      : ! - This function never returns.
 ******************************************************************************/
 #[unsafe(no_mangle)]
-pub extern "C" fn main(cpuid: u64) -> ! {
-    if cpuid == 0 {
-        bench_main()
+pub extern "C" fn main(CPUID: u64) -> ! {
+    if CPUID == 0 {
+        RME_Benchmark()
     }
 
     /* Secondary harts: print a-z once, then idle */
-    let mut ch: u8 = b'a';
-    while ch <= b'z' {
-        bench_print_char(ch);
-        ch += 1;
+    let mut Ch: u8 = b'a';
+    while Ch <= b'z' {
+        RME_Bench_Print_Char(Ch);
+        Ch += 1;
     }
-    bench_print_char(b'\r');
-    bench_print_char(b'\n');
+    RME_Bench_Print_Char(b'\r');
+    RME_Bench_Print_Char(b'\n');
 
     loop {}
 }
