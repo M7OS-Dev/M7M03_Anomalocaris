@@ -130,6 +130,9 @@ pub const RME_RV64V_KFN_CACHE_INV_ADDR: rme_ptr_t = 6;
 pub const RME_RV64V_KFN_CACHE_CLEAN_INV_ALL: rme_ptr_t = 10;
 pub const RME_RV64V_KFN_CACHE_CLEAN_INV_ADDR: rme_ptr_t = 11;
 pub const RME_RV64V_CACHE_BLOCK_SIZE: rme_ptr_t = 64;
+/* The logical ASID range on the RV64V port. The caller owns the allocation;
+ * ASID 0 is reserved for untagged/not-yet-configured tables. */
+pub const RME_RV64V_SATP_ASID_MAX: rme_ptr_t = 0xFFFF;
 
 /* RV64V page-table entry query KFN sub-IDs **********************************/
 pub const RME_RV64V_KFN_PGT_ENTRY_MOD_FLAG_GET: rme_ptr_t = 0;

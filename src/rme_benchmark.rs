@@ -190,9 +190,10 @@ use crate::rme_syscall::{
     RME_RV64V_KFN_DEBUG_EXC_ADDR_GET, RME_RV64V_KFN_DEBUG_EXC_CAUSE_GET,
     RME_RV64V_KFN_DEBUG_EXC_VALUE_GET, RME_RV64V_KFN_DEBUG_INV_MOD_SP_GET,
     RME_RV64V_KFN_DEBUG_REG_MOD_X10_A0, RME_RV64V_KFN_PGT_ENTRY_MOD_FLAG_GET,
-    RME_RV64V_KFN_PGT_ENTRY_MOD_NMORD_GET, RME_RV64V_KFN_PGT_ENTRY_MOD_SZORD_GET, RME_SIG_FLAG_ALL,
-    RME_Sig_Crt, RME_Sig_Del, RME_Sig_Rcv, RME_Sig_Snd, RME_THD_FLAG_ALL, RME_THD_FLAG_SWT,
-    RME_Thd_Crt, RME_Thd_Exec_Set, RME_Thd_Sched_Bind, RME_Thd_Swt, RME_Thd_Time_Xfer, rme_ptr_t,
+    RME_RV64V_KFN_PGT_ENTRY_MOD_NMORD_GET, RME_RV64V_KFN_PGT_ENTRY_MOD_SZORD_GET,
+    RME_RV64V_SATP_ASID_MAX, RME_SIG_FLAG_ALL, RME_Sig_Crt, RME_Sig_Del, RME_Sig_Rcv, RME_Sig_Snd,
+    RME_THD_FLAG_ALL, RME_THD_FLAG_SWT, RME_Thd_Crt, RME_Thd_Exec_Set, RME_Thd_Sched_Bind,
+    RME_Thd_Swt, RME_Thd_Time_Xfer, rme_ptr_t,
 };
 /* End Include ***************************************************************/
 
@@ -257,6 +258,14 @@ static mut RME_Bench_Cap_Sig_Data: rme_ptr_t = 0;
  * carved out of this bump pointer, and each fixture consumes one distinct
  * range for the lifetime of the run. */
 static mut RME_Bench_Kom_Next: rme_ptr_t = RME_BENCH_KOM_FRONTIER;
+
+/* The caller-owned ASID allocator. ASID 0 is the kernel's untagged fallback,
+ * so the benchmark starts at 1. A production manager would keep a bitmap or
+ * free list; the benchmark's address spaces live until the run ends, so a
+ * bump allocator is enough here. */
+static mut RME_Bench_Asid_Next: rme_ptr_t = 1;
+/* The ASID assigned to process 2's root page table. */
+static mut RME_Bench_Asid_P2: rme_ptr_t = 0;
 /* End Private Variables *****************************************************/
 
 /* Function:RME_Bench_Read_Cycle ***************************************************
@@ -475,6 +484,54 @@ fn RME_Bench_Setup_Check(Label: &str, Ret: rme_ptr_t) {
     }
 }
 /* End Function:RME_Bench_Setup_Check *******************************************/
+
+/* Function:RME_Bench_Asid_Alloc *************************************************
+Description : Allocate a caller-owned ASID. The RV64V kernel no longer assigns
+              ASIDs automatically; ASID 0 stays reserved for untagged tables,
+              so the first usable value is 1. The benchmark keeps its address
+              spaces for the whole run, so a monotonic bump allocator matches
+              its lifetime model.
+Input       : None.
+Output      : None.
+Return      : rme_ptr_t - A unique non-zero ASID.
+*****************************************************************************/
+fn RME_Bench_Asid_Alloc() -> rme_ptr_t {
+    unsafe {
+        let Asid = core::ptr::read_volatile(&raw const RME_Bench_Asid_Next);
+
+        if Asid > RME_RV64V_SATP_ASID_MAX {
+            RME_BENCH_PRINT!("bench setup failed: ASID space exhausted\r\n");
+            RME_BENCH_PRINT!("RME BENCH REPORT ABORTED\r\n");
+
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+
+        core::ptr::write_volatile(&raw mut RME_Bench_Asid_Next, Asid + 1);
+        Asid
+    }
+}
+/* End Function:RME_Bench_Asid_Alloc *********************************************/
+
+/* Function:RME_Bench_Asid_Set ***************************************************
+Description : Program one top-level page table with a caller-allocated ASID.
+              The KFN flushes the old and new ASID before the change, so the
+              caller only has to guarantee that the ASID is unique among live
+              address spaces.
+Input       : Label - The setup step name, printed on failure.
+              Cap_Pgt - The top-level page table capability.
+              Asid - The caller-allocated ASID.
+Output      : None.
+Return      : None.
+*****************************************************************************/
+fn RME_Bench_Asid_Set(Label: &str, Cap_Pgt: rme_ptr_t, Asid: rme_ptr_t) {
+    RME_Bench_Setup_Check(
+        Label,
+        RME_Kfn(RME_BOOT_INIT_KFN, RME_KFN_PGT_ASID_SET, Cap_Pgt, Asid, 0),
+    );
+}
+/* End Function:RME_Bench_Asid_Set ***********************************************/
 
 /* Function:RME_Bench_Setup_Try **************************************************
 Description : Check the result of one setup system call of a single test. A
@@ -1211,6 +1268,14 @@ fn RME_Bench_Prepare_Process2() {
         "PGT_CRT process2 root",
         RME_Bench_Pgt_Crt(RME_BENCH_CAP_PGT_TOP_NEW, Raddr, 0, 1, RME_PGT_SIZE_1G),
     );
+    /* The caller owns ASID assignment: give process 2 its own ASID before any
+     * thread can switch to this root table. The KFN flushes both the old and
+     * the new ASID, so the table does not inherit stale translations. */
+    let Asid = RME_Bench_Asid_Alloc();
+    RME_Bench_Asid_Set("PGT_ASID process2 root", RME_BENCH_CAP_PGT_TOP_NEW, Asid);
+    unsafe {
+        core::ptr::write_volatile(&raw mut RME_Bench_Asid_P2, Asid);
+    }
     /* L1: 2MB entries, covers the user window [0,1GB) */
     let Raddr = RME_Bench_Kom_Alloc_Pgt();
     RME_Bench_Setup_Check(
@@ -2139,8 +2204,10 @@ fn RME_Bench_Test_Kfn_Pgt_Entry_Mod(Stat: &mut RME_Bench_Stat, Operation: rme_pt
 
 /* Function:RME_Bench_Test_Kfn_Pgt_Asid_Set *************************************
 Description : Measure KFN PGT_ASID_SET on process 2's root page table. The
-              ASID alternates between 2 and 3, so every round flushes the old
-              and the new ASID before the change.
+              ASID alternates between the one assigned to process 2 and a
+              caller-allocated scratch value, so every round flushes the old
+              and the new ASID before the change. Process 2 is not running
+              while this test executes, so borrowing its root table is safe.
 Input       : Stat - The statistics accumulator.
 Output      : None.
 Return      : None.
@@ -2148,8 +2215,11 @@ Return      : None.
 fn RME_Bench_Test_Kfn_Pgt_Asid_Set(Stat: &mut RME_Bench_Stat) {
     Stat.Reset();
 
-    let mut Asid: rme_ptr_t = 3;
+    let P2_Asid = unsafe { core::ptr::read_volatile(&raw const RME_Bench_Asid_P2) };
+    let Scratch_Asid = RME_Bench_Asid_Alloc();
+    let mut Asid = Scratch_Asid;
     let mut Count: u64 = 0;
+
     while Count < RME_BENCH_LOOP_NUM && Stat.Fail == 0 {
         let Start = RME_Bench_Read_Cycle();
         let Ret = RME_Kfn(
@@ -2164,14 +2234,30 @@ fn RME_Bench_Test_Kfn_Pgt_Asid_Set(Stat: &mut RME_Bench_Stat) {
         let _ = Stat.Set_Ret(Ret as i64);
         Stat.Record((End - Start) as u32);
 
-        Asid = if Asid == 3 { 2 } else { 3 };
+        Asid = if Asid == Scratch_Asid {
+            P2_Asid
+        } else {
+            Scratch_Asid
+        };
         Count += 1;
     }
+
+    /* Leave process 2 on its own ASID regardless of the loop parity. */
+    let _ = RME_Kfn(
+        RME_BOOT_INIT_KFN,
+        RME_KFN_PGT_ASID_SET,
+        RME_BENCH_CAP_PGT_TOP_NEW,
+        P2_Asid,
+        0,
+    );
 }
 /* End Function:RME_Bench_Test_Kfn_Pgt_Asid_Set *********************************/
 
 /* Function:RME_Bench_Test_Kfn_Pgt_Cache_Clr *************************************
-Description : Measure KFN PGT_CACHE_CLR: a full local TLB flush.
+Description : Measure KFN PGT_CACHE_CLR on the init process's root page table.
+              The KFN selects the table through Sub_ID and flushes that table's
+              ASID, so the timed window contains the capability lookup and one
+              local sfence.vma.
 Input       : Stat - The statistics accumulator.
 Output      : None.
 Return      : None.
@@ -2182,7 +2268,13 @@ fn RME_Bench_Test_Kfn_Pgt_Cache_Clr(Stat: &mut RME_Bench_Stat) {
     let mut Count: u64 = 0;
     while Count < RME_BENCH_LOOP_NUM && Stat.Fail == 0 {
         let Start = RME_Bench_Read_Cycle();
-        let Ret = RME_Kfn(RME_BOOT_INIT_KFN, RME_KFN_PGT_CACHE_CLR, 0, 0, 0);
+        let Ret = RME_Kfn(
+            RME_BOOT_INIT_KFN,
+            RME_KFN_PGT_CACHE_CLR,
+            RME_BOOT_INIT_PGT,
+            0,
+            0,
+        );
         let End = RME_Bench_Read_Cycle();
 
         let _ = Stat.Set_Ret(Ret as i64);
@@ -2193,7 +2285,9 @@ fn RME_Bench_Test_Kfn_Pgt_Cache_Clr(Stat: &mut RME_Bench_Stat) {
 /* End Function:RME_Bench_Test_Kfn_Pgt_Cache_Clr *********************************/
 
 /* Function:RME_Bench_Test_Kfn_Pgt_Line_Clr **************************************
-Description : Measure KFN PGT_LINE_CLR on the init image page, all ASIDs.
+Description : Measure KFN PGT_LINE_CLR on the init image page. The KFN selects
+              the root page table through Sub_ID and flushes one virtual
+              address of that table's ASID.
 Input       : Stat - The statistics accumulator.
 Output      : None.
 Return      : None.
@@ -2207,9 +2301,9 @@ fn RME_Bench_Test_Kfn_Pgt_Line_Clr(Stat: &mut RME_Bench_Stat) {
         let Ret = RME_Kfn(
             RME_BOOT_INIT_KFN,
             RME_KFN_PGT_LINE_CLR,
-            0,          /* Sub_ID is unused by this KFN */
-            0x20000000, /* Vaddr: init image window */
-            0,          /* ASID 0: all ASIDs */
+            RME_BOOT_INIT_PGT, /* Sub_ID: top-level page table */
+            0x20000000,        /* Param1: init image window */
+            0,                 /* unused */
         );
         let End = RME_Bench_Read_Cycle();
 
@@ -2456,6 +2550,12 @@ pub fn RME_Benchmark() -> ! {
         "{:<44} : AVG / MAX / MIN / ret\r\n",
         "Test (number in CPU cycles)"
     );
+
+    /* The caller owns ASID assignment. Give the init process an ASID before
+     * any inter-process switch; the switch that follows writes it into satp.
+     * ASID 0 remains the kernel's untagged fallback. */
+    let Asid = RME_Bench_Asid_Alloc();
+    RME_Bench_Asid_Set("PGT_ASID init", RME_BOOT_INIT_PGT, Asid);
 
     /* Prepare the shared fixtures. A failed preparation step means that the
      * measurement environment is broken, so the benchmark is halted right
