@@ -99,7 +99,7 @@ const RME_BENCH_CAP2_INIT_THD: rme_ptr_t = 1; /* The init thread, delegated */
 const RME_BENCH_CAP2_SIG_DATA: rme_ptr_t = 2; /* The data channel endpoint, delegated */
 const RME_BENCH_CAP2_SIG_PARK: rme_ptr_t = 3; /* The parking endpoint, delegated */
 const RME_BENCH_CAP2_THD2: rme_ptr_t = 4; /* The switch target thread of process 2 */
-const RME_BENCH_CAP2_INV2: rme_ptr_t = 5; /* The second invocation stub, delegated */
+/* Slot 5 is unused. */
 const RME_BENCH_CAP2_KFN: rme_ptr_t = 6; /* The KFN capability, used by DEBUG_INV_MOD */
 
 /* The preemptive priorities the benchmark uses. The init thread runs at
@@ -179,7 +179,7 @@ use crate::rme_syscall::{
     RME_BOOT_INIT_CPT, RME_BOOT_INIT_KFN, RME_BOOT_INIT_KOM, RME_BOOT_INIT_PGT,
     RME_BOOT_INIT_PGT_L2, RME_BOOT_INIT_PRC, RME_BOOT_INIT_THD, RME_BOOT_INIT_THD_SLOT,
     RME_BOOT_TBL_THD, RME_CID_Build, RME_CID_NULL, RME_Cpt_Add, RME_Cpt_Crt, RME_Cpt_Frz,
-    RME_INV_FLAG_ALL, RME_Inv_Act, RME_Inv_Crt, RME_Inv_Ret, RME_Inv_Set, RME_KFN_CACHE_MAINT,
+    RME_Inv_Act, RME_Inv_Crt, RME_Inv_Set, RME_KFN_CACHE_MAINT,
     RME_KFN_DEBUG_EXC_GET, RME_KFN_DEBUG_INV_MOD, RME_KFN_DEBUG_PRINT, RME_KFN_DEBUG_REG_MOD,
     RME_KFN_FLAG_FULL_RANGE, RME_KFN_IDLE_SLEEP, RME_KFN_PGT_ASID_SET, RME_KFN_PGT_CACHE_CLR,
     RME_KFN_PGT_ENTRY_MOD, RME_KFN_PGT_LINE_CLR, RME_Kfn, RME_PGT_ALL_DYN, RME_PGT_ALL_PERM,
@@ -234,10 +234,6 @@ static mut RME_Bench_Stat_Ret: i64 = 0;
  * the current test and prevents the failed sample from entering the stats. */
 static mut RME_Bench_Stat_Fail: u64 = 0;
 
-/* Set by the nested INV_RET stub when its inner INV_ACT fails. The outer
- * invoker checks this before reporting the nested round as successful. */
-static mut RME_Bench_Inv_Nest_Err: i64 = 0;
-
 /* The return value of the DEBUG_INV_MOD call made inside the invocation stub.
  * The stub runs in process 2's capability namespace, the invoker reads this
  * shared slot after the invocation returns. */
@@ -259,11 +255,9 @@ static mut RME_Bench_Cap_Sig_Data: rme_ptr_t = 0;
  * range for the lifetime of the run. */
 static mut RME_Bench_Kom_Next: rme_ptr_t = RME_BENCH_KOM_FRONTIER;
 
-/* The caller-owned ASID allocator. ASID 0 is the kernel's untagged fallback,
- * so the benchmark starts at 1. A production manager would keep a bitmap or
- * free list; the benchmark's address spaces live until the run ends, so a
- * bump allocator is enough here. */
-static mut RME_Bench_Asid_Next: rme_ptr_t = 1;
+/* The caller-owned ASID allocator. The kernel gives the init address space
+ * the smallest ASID and the KFN refuses it, so the benchmark starts above it. */
+static mut RME_Bench_Asid_Next: rme_ptr_t = 2;
 /* The ASID assigned to process 2's root page table. */
 static mut RME_Bench_Asid_P2: rme_ptr_t = 0;
 /* End Private Variables *****************************************************/
@@ -949,85 +943,111 @@ fn RME_Bench_Sig_Crt(Cap_Sig: u64) -> u64 {
 }
 /* End Function:RME_Bench_Sig_Crt *************************************************/
 
+/* Function:RME_Bench_Inv_Entry_Body *******************************************
+Description : Round-trip stub body; a normal return restores s0-s11.
+Input       : _param - Unused.
+Output      : None.
+Return      : u64 - The value passed to the invoker by INV_RET.
+*****************************************************************************/
+extern "C" fn RME_Bench_Inv_Entry_Body(_param: u64) -> u64 {
+    0x1234
+}
+/* End Function:RME_Bench_Inv_Entry_Body ***************************************/
+
 /* Function:RME_Bench_Inv_Entry *************************************************
-Description : The entry point of the invocation. It runs in the address space
-              of the second process, with the second process' page table
-              active, and returns to the invoker immediately.
+Description : Round-trip invocation entry: call the body, then INV_RET.
 Input       : param - The parameter the invoker passed (unused).
 Output      : None.
 Return      : ! - This function never returns.
 *****************************************************************************/
+#[unsafe(naked)]
 extern "C" fn RME_Bench_Inv_Entry(_param: u64) -> ! {
-    let _ = RME_Inv_Ret(0x1234);
-
-    /* The return above resumes the invoker - this thread never runs again. */
-    loop {}
+    core::arch::naked_asm!(
+        "call {body}",
+        "mv a1, a0",
+        "li a0, 0",
+        "li a2, 0",
+        "li a3, 0",
+        "ecall",
+        "j .",
+        body = sym RME_Bench_Inv_Entry_Body,
+    );
 }
 /* End Function:RME_Bench_Inv_Entry **********************************************/
 
+/* Function:RME_Bench_Inv_Act_Entry_Body ***************************************
+Description : One-way stub body; latches the arrival time.
+Input       : _param - Unused.
+Output      : None.
+Return      : u64 - The value passed to the invoker by INV_RET.
+*****************************************************************************/
+extern "C" fn RME_Bench_Inv_Act_Entry_Body(_param: u64) -> u64 {
+    RME_Bench_End_Set(RME_Bench_Read_Cycle());
+    0x1111
+}
+/* End Function:RME_Bench_Inv_Act_Entry_Body ***********************************/
+
 /* Function:RME_Bench_Inv_Act_Entry **********************************************
-Description : One-way INV_ACT entry. It latches the arrival time and returns
-              immediately; the invoker reads that timestamp after INV_ACT
-              returns, so the measurement covers entry only, not the return.
+Description : One-way entry: call the body, then INV_RET.
 Input       : _param - Unused.
 Output      : None.
 Return      : ! - This function never returns here.
 *****************************************************************************/
+#[unsafe(naked)]
 extern "C" fn RME_Bench_Inv_Act_Entry(_param: u64) -> ! {
-    RME_Bench_End_Set(RME_Bench_Read_Cycle());
-    let _ = RME_Inv_Ret(0x1111);
-    loop {}
+    core::arch::naked_asm!(
+        "call {body}",
+        "mv a1, a0",
+        "li a0, 0",
+        "li a2, 0",
+        "li a3, 0",
+        "ecall",
+        "j .",
+        body = sym RME_Bench_Inv_Act_Entry_Body,
+    );
 }
 /* End Function:RME_Bench_Inv_Act_Entry ******************************************/
 
-/* Function:RME_Bench_Inv_Nest_Entry *********************************************
-Description : Outer stub of the nested INV_RET test. It invokes the inner stub
-              and latches END when that invocation returns, then returns to the
-              original invoker.
+/* Function:RME_Bench_Inv_Ret_Entry_Body ***************************************
+Description : Direct-return stub body; latches START.
 Input       : _param - Unused.
 Output      : None.
-Return      : ! - This function never returns here.
+Return      : u64 - The value passed to the invoker by INV_RET.
 *****************************************************************************/
-extern "C" fn RME_Bench_Inv_Nest_Entry(_param: u64) -> ! {
-    let Ret = RME_Inv_Act(RME_BENCH_CAP2_INV2, 0x2222);
-
-    /* Publish the inner activation failure. The outer invoker checks this
-     * before it reports the nested INV_RET round as successful. */
-    if !Ret.Ok() {
-        unsafe {
-            core::ptr::write_volatile(&raw mut RME_Bench_Inv_Nest_Err, Ret.Status());
-        }
-    }
-
-    RME_Bench_End_Set(RME_Bench_Read_Cycle());
-    let _ = RME_Inv_Ret(0x3333);
-    loop {}
+extern "C" fn RME_Bench_Inv_Ret_Entry_Body(_param: u64) -> u64 {
+    RME_Bench_Start_Set(RME_Bench_Read_Cycle());
+    0x4444
 }
-/* End Function:RME_Bench_Inv_Nest_Entry *****************************************/
+/* End Function:RME_Bench_Inv_Ret_Entry_Body ***********************************/
 
 /* Function:RME_Bench_Inv_Ret_Entry **********************************************
-Description : Inner stub of the nested INV_RET test. It latches START and
-              immediately executes INV_RET.
+Description : Direct-return entry: call the body, then INV_RET.
 Input       : _param - Unused.
 Output      : None.
 Return      : ! - This function never returns here.
 *****************************************************************************/
+#[unsafe(naked)]
 extern "C" fn RME_Bench_Inv_Ret_Entry(_param: u64) -> ! {
-    RME_Bench_Start_Set(RME_Bench_Read_Cycle());
-    let _ = RME_Inv_Ret(0x4444);
-    loop {}
+    core::arch::naked_asm!(
+        "call {body}",
+        "mv a1, a0",
+        "li a0, 0",
+        "li a2, 0",
+        "li a3, 0",
+        "ecall",
+        "j .",
+        body = sym RME_Bench_Inv_Ret_Entry_Body,
+    );
 }
 /* End Function:RME_Bench_Inv_Ret_Entry ******************************************/
 
-/* Function:RME_Bench_Inv_Dbg_Entry **********************************************
-Description : DEBUG_INV_MOD invocation stub. It runs with process 2's
-              capabilities and a non-empty invocation stack; it measures the
-              layer-0 SP query and publishes the return value.
+/* Function:RME_Bench_Inv_Dbg_Entry_Body ***************************************
+Description : DEBUG_INV_MOD stub body; measures the layer-0 SP query.
 Input       : _param - Unused.
 Output      : None.
-Return      : ! - This function never returns here.
+Return      : u64 - The value passed to the invoker by INV_RET.
 *****************************************************************************/
-extern "C" fn RME_Bench_Inv_Dbg_Entry(_param: u64) -> ! {
+extern "C" fn RME_Bench_Inv_Dbg_Entry_Body(_param: u64) -> u64 {
     RME_Bench_Start_Set(RME_Bench_Read_Cycle());
     let Ret = RME_Kfn(
         RME_BENCH_CAP2_KFN,
@@ -1040,8 +1060,28 @@ extern "C" fn RME_Bench_Inv_Dbg_Entry(_param: u64) -> ! {
     unsafe {
         core::ptr::write_volatile(&raw mut RME_Bench_Kfn_Inv_Ret, Ret as i64);
     }
-    let _ = RME_Inv_Ret(0x5555);
-    loop {}
+    0x5555
+}
+/* End Function:RME_Bench_Inv_Dbg_Entry_Body ***********************************/
+
+/* Function:RME_Bench_Inv_Dbg_Entry **********************************************
+Description : DEBUG_INV_MOD entry: call the body, then INV_RET.
+Input       : _param - Unused.
+Output      : None.
+Return      : ! - This function never returns here.
+*****************************************************************************/
+#[unsafe(naked)]
+extern "C" fn RME_Bench_Inv_Dbg_Entry(_param: u64) -> ! {
+    core::arch::naked_asm!(
+        "call {body}",
+        "mv a1, a0",
+        "li a0, 0",
+        "li a2, 0",
+        "li a3, 0",
+        "ecall",
+        "j .",
+        body = sym RME_Bench_Inv_Dbg_Entry_Body,
+    );
 }
 /* End Function:RME_Bench_Inv_Dbg_Entry *******************************************/
 
@@ -1557,8 +1597,7 @@ fn RME_Bench_Prepare_Invocation() {
         ),
     );
 
-    /* The second stub is used by the one-way INV_ACT test and as the inner
-     * stub of the nested INV_RET test. */
+    /* The second stub is used by the one-way INV_ACT test. */
     let Raddr2 = RME_Bench_Kom_Alloc_Inv();
     RME_Bench_Setup_Check(
         "INV_CRT one-way stub",
@@ -1579,19 +1618,6 @@ fn RME_Bench_Prepare_Invocation() {
             Entry2,
             Stack2,
             0,
-        ),
-    );
-
-    /* The nested stub runs inside process 2, so it needs the inner stub in
-     * process 2's own capability table. */
-    RME_Bench_Setup_Check(
-        "CPT_ADD nested stub -> process2",
-        RME_Cpt_Add(
-            RME_BENCH_CAP_CPT,
-            RME_BENCH_CAP2_INV2,
-            RME_BOOT_INIT_CPT,
-            RME_BENCH_CAP_INV2,
-            RME_INV_FLAG_ALL,
         ),
     );
 
@@ -1865,12 +1891,23 @@ Description : Measure the cost of a synchronous invocation. The invoker
               activates the stub, which runs in the second process'
               address space and returns immediately, so this is the full
               round trip through the kernel.
+              The direct INV_RET test leaves its stub installed here.
 Input       : Stat - The statistics accumulator.
 Output      : None.
 Return      : None.
 *****************************************************************************/
 fn RME_Bench_Test_Invocation(Stat: &mut RME_Bench_Stat) {
     let Cap_Inv = RME_CID_Build(RME_BOOT_INIT_CPT, RME_BENCH_CAP_INV);
+    let Entry = RME_Bench_Inv_Entry as extern "C" fn(u64) -> ! as u64;
+    let Stack = RME_Bench_Stack_Top(&raw const RME_Bench_Stack_INV);
+    if !RME_Bench_Setup_Try(
+        Stat,
+        "INV_SET round-trip stub",
+        RME_Inv_Set(Cap_Inv, Entry, Stack, 0),
+    ) {
+        return;
+    }
+
     let mut Count: u64 = 0;
 
     Stat.Reset();
@@ -1924,31 +1961,20 @@ fn RME_Bench_Test_Inv_Act(Stat: &mut RME_Bench_Stat) {
 /* End Function:RME_Bench_Test_Inv_Act *******************************************/
 
 /* Function:RME_Bench_Test_Inv_Ret **********************************************
-Description : Nested INV_RET measurement. The outer stub invokes the inner
-              stub; the inner stub latches START and executes INV_RET, and the
-              outer stub latches END when its inner INV_ACT returns.
+Description : Direct cross-process INV_RET measurement; includes the satp
+              switch back to the invoker.
 Input       : Stat - The statistics accumulator.
 Output      : None.
 Return      : None.
 *****************************************************************************/
 fn RME_Bench_Test_Inv_Ret(Stat: &mut RME_Bench_Stat) {
-    let Cap_Inv1 = RME_CID_Build(RME_BOOT_INIT_CPT, RME_BENCH_CAP_INV);
-    let Cap_Inv2 = RME_CID_Build(RME_BOOT_INIT_CPT, RME_BENCH_CAP_INV2);
-    let Entry1 = RME_Bench_Inv_Nest_Entry as extern "C" fn(u64) -> ! as u64;
-    let Entry2 = RME_Bench_Inv_Ret_Entry as extern "C" fn(u64) -> ! as u64;
-    let Stack1 = RME_Bench_Stack_Top(&raw const RME_Bench_Stack_INV);
-    let Stack2 = RME_Bench_Stack_Top(&raw const RME_Bench_Stack_INV2);
+    let Cap_Inv = RME_CID_Build(RME_BOOT_INIT_CPT, RME_BENCH_CAP_INV);
+    let Entry = RME_Bench_Inv_Ret_Entry as extern "C" fn(u64) -> ! as u64;
+    let Stack = RME_Bench_Stack_Top(&raw const RME_Bench_Stack_INV);
     if !RME_Bench_Setup_Try(
         Stat,
-        "INV_SET nested outer stub",
-        RME_Inv_Set(Cap_Inv1, Entry1, Stack1, 0),
-    ) {
-        return;
-    }
-    if !RME_Bench_Setup_Try(
-        Stat,
-        "INV_SET nested inner stub",
-        RME_Inv_Set(Cap_Inv2, Entry2, Stack2, 0),
+        "INV_SET direct-return stub",
+        RME_Inv_Set(Cap_Inv, Entry, Stack, 0),
     ) {
         return;
     }
@@ -1957,23 +1983,13 @@ fn RME_Bench_Test_Inv_Ret(Stat: &mut RME_Bench_Stat) {
 
     let mut Count: u64 = 0;
     while Count < RME_BENCH_LOOP_NUM && Stat.Fail == 0 {
-        unsafe {
-            core::ptr::write_volatile(&raw mut RME_Bench_Inv_Nest_Err, 0);
-        }
+        let Ret = RME_Inv_Act(Cap_Inv, 0);
+        let End = RME_Bench_Read_Cycle();
 
-        let Ret = RME_Inv_Act(Cap_Inv1, 0);
-        let Nest_Err = unsafe { core::ptr::read_volatile(&raw const RME_Bench_Inv_Nest_Err) };
+        /* a0 is the activation status; a1 is the callee's INV_RET value. */
+        let _ = Stat.Set_Ret(Ret.Status());
 
-        let Verdict = if !Ret.Ok() {
-            Ret.Status()
-        } else if Nest_Err < 0 {
-            Nest_Err
-        } else {
-            Ret.Status()
-        };
-        let _ = Stat.Set_Ret(Verdict);
-
-        Stat.Record((RME_Bench_End_Get() - RME_Bench_Start_Get()) as u32);
+        Stat.Record((End - RME_Bench_Start_Get()) as u32);
         Count += 1;
     }
 }
@@ -2551,11 +2567,9 @@ pub fn RME_Benchmark() -> ! {
         "Test (number in CPU cycles)"
     );
 
-    /* The caller owns ASID assignment. Give the init process an ASID before
-     * any inter-process switch; the switch that follows writes it into satp.
-     * ASID 0 remains the kernel's untagged fallback. */
-    let Asid = RME_Bench_Asid_Alloc();
-    RME_Bench_Asid_Set("PGT_ASID init", RME_BOOT_INIT_PGT, Asid);
+    /* The caller owns the ASID assignment of the address spaces it creates.
+     * The init address space is tagged by the kernel, so only the second
+     * process needs one here. */
 
     /* Prepare the shared fixtures. A failed preparation step means that the
      * measurement environment is broken, so the benchmark is halted right
@@ -2596,11 +2610,11 @@ pub fn RME_Benchmark() -> ! {
 
     /* ---- Invocation ---- */
     RME_Bench_Test_Inv_Act(&mut Stat);
-    RME_Bench_Report("INV_ACT(one-way entry)", &Stat);
+    RME_Bench_Report("INV_ACT(inter, one-way)", &Stat);
     RME_Bench_Test_Inv_Ret(&mut Stat);
-    RME_Bench_Report("INV_RET(nested return)", &Stat);
+    RME_Bench_Report("INV_RET(inter, one-way)", &Stat);
     RME_Bench_Test_Invocation(&mut Stat);
-    RME_Bench_Report("INV_ACT+INV_RET(round-trip)", &Stat);
+    RME_Bench_Report("INV_ACT+INV_RET(inter, round-trip)", &Stat);
 
     /* ---- KFN: testable success paths ---- */
     RME_Bench_Test_Kfn_Pgt_Entry_Mod(&mut Stat, RME_RV64V_KFN_PGT_ENTRY_MOD_FLAG_GET);

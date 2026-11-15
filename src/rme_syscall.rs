@@ -673,70 +673,8 @@ pub fn RME_Inv_Set(
 }
 /* End Function:RME_Inv_Set ***************************************************/
 
-/* The invocation entry/return path only restores PC and SP. The invocation
- * stub may clobber ra and s0-s11 because it exits through INV_RET instead of
- * running its function epilogue. The compiler cannot express s0/s1 as inline
- * asm clobbers (s0 is the frame pointer and s1 is reserved by LLVM), so this
- * tiny gate saves/restores ra and s0-s11 around the ecall. Caller-saved
- * registers are covered by the normal extern "C" call boundary.
- *
- * The gate returns two registers (a0/a1); the Rust wrapper assembles RME_Ret
- * with a2 = 0. RME_Ret itself is 24 bytes, so it is not returned directly
- * through the C ABI. */
-#[repr(C)]
-struct RME_Ret_A0A1 {
-    A0: rme_ptr_t,
-    A1: rme_ptr_t,
-}
-
-core::arch::global_asm!(
-    r#"
-    .section .text.RME_Inv_Act_asm, "ax", @progbits
-    .align 2
-    .global RME_Inv_Act_ASM
-RME_Inv_Act_ASM:
-    addi sp, sp, -112
-    sd ra, 0(sp)
-    sd s0, 8(sp)
-    sd s1, 16(sp)
-    sd s2, 24(sp)
-    sd s3, 32(sp)
-    sd s4, 40(sp)
-    sd s5, 48(sp)
-    sd s6, 56(sp)
-    sd s7, 64(sp)
-    sd s8, 72(sp)
-    sd s9, 80(sp)
-    sd s10, 88(sp)
-    sd s11, 96(sp)
-    mv a2, a1
-    mv a1, a0
-    li a0, 1
-    slli a0, a0, 32
-    li a3, 0
-    ecall
-    ld ra, 0(sp)
-    ld s0, 8(sp)
-    ld s1, 16(sp)
-    ld s2, 24(sp)
-    ld s3, 32(sp)
-    ld s4, 40(sp)
-    ld s5, 48(sp)
-    ld s6, 56(sp)
-    ld s7, 64(sp)
-    ld s8, 72(sp)
-    ld s9, 80(sp)
-    ld s10, 88(sp)
-    ld s11, 96(sp)
-    addi sp, sp, 112
-    ret
-"#
-);
-
-unsafe extern "C" {
-    fn RME_Inv_Act_ASM(Cap_Inv: rme_ptr_t, Param: rme_ptr_t) -> RME_Ret_A0A1;
-}
-
+/* The stub body's epilogue restores s0-s11; this gate only declares
+ * caller-saved clobbers. */
 /* Function:RME_Inv_Act *******************************************************
 Description : Activate an invocation stub. a0 is the syscall status (0 or a
               non-negative success value, negative on failure), a1 is the
@@ -748,10 +686,41 @@ Return      : RME_Ret - (a0, a1, 0).
 *****************************************************************************/
 #[inline(always)]
 pub fn RME_Inv_Act(Cap_Inv: rme_ptr_t, Param: rme_ptr_t) -> RME_Ret {
-    let Ret = unsafe { RME_Inv_Act_ASM(Cap_Inv, Param) };
+    let A0: rme_ptr_t;
+    let A1: rme_ptr_t;
+
+    unsafe {
+        core::arch::asm!(
+            "mv a2, a1",
+            "mv a1, a0",
+            "li a0, 1",
+            "slli a0, a0, 32",
+            "li a3, 0",
+            "ecall",
+            inout("a0") Cap_Inv => A0,
+            inout("a1") Param => A1,
+            /* The stub may clobber caller-saved registers; s0-s11 are
+             * preserved by the body's epilogue. */
+            out("a2") _,
+            out("a3") _,
+            out("a4") _,
+            out("a5") _,
+            out("a6") _,
+            out("a7") _,
+            out("ra") _,
+            out("t0") _,
+            out("t1") _,
+            out("t2") _,
+            out("t3") _,
+            out("t4") _,
+            out("t5") _,
+            out("t6") _,
+        );
+    }
+
     RME_Ret {
-        A0: Ret.A0,
-        A1: Ret.A1,
+        A0,
+        A1,
         A2: 0,
     }
 }
