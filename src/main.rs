@@ -12,8 +12,7 @@ Description : The first user-mode program (init) for the RV64V port on
               This is the init program (first user process) for the RV64V port
               of the RME microkernel (M7M01_Eukaron), written in Rust. The
               kernel's Project/GCC-RV64V build invokes this project's build.sh
-              and copies the resulting build/init.bin into its Object/ folder,
-              where qemu.sh loads it at 0x81030000.
+               and embeds the resulting build/init.bin in the kernel image.
 ******************************************************************************/
 
 /* Attribute *****************************************************************/

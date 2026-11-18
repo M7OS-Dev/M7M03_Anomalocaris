@@ -119,9 +119,7 @@ const RME_BENCH_PHASE_SIG_RECV2: u32 = 3; /* Process 2's helper receives and mea
 const RME_BENCH_PHASE_SIG_RCV_ONLY: u32 = 4; /* Process 1's helper measures receive only */
 
 /* The kernel memory frontier for the objects the benchmark creates. The
- * init image is physically at 0x81030000 and the 32-page mapping ends at
- * 0x81050000, i.e. KOM-relative 0x50000. Start above that to avoid
- * overwriting the image (and its .bss) with kernel objects.
+ * embedded init image is outside KOM. Start above the reserved boot objects.
  * Every kernel object the benchmark creates is carved out of this region by
  * the bump allocator: the second process, its page tables, the helper
  * threads and the invocation stubs. One frontier is enough, because the bump

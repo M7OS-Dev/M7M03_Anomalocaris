@@ -5,11 +5,9 @@ Date        : 13/10/2026
 Licence     : The Unlicense; see LICENSE for details.
 Description : The linker script for the user-mode init program, mirroring the
               C init.ld in M7M01_Eukaron/Project/GCC-RV64V/init/.
-              QEMU loads the raw binary at the physical 0x81030000 (see the
-              kernel's qemu.sh), but the program is linked and runs at the
-              user virtual address 0x20000000 (same as X64); the kernel maps
-              it and its stack (VA 0x201F0000..0x20200000) onto the physical
-              pages.
+               The kernel embeds the raw binary, but the program is linked
+               and runs at user virtual address 0x20000000 (same as X64).
+               The kernel maps the image and its stack onto physical pages.
 ******************************************************************************/
 
 OUTPUT_FORMAT("elf64-littleriscv")
